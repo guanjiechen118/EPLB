@@ -815,12 +815,14 @@ class Llama4ForConditionalGeneration(
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         expert_load_fgate: torch.Tensor | None = None,
+        fgate_skip_prefill: bool = False,
     ):
         self.language_model.set_eplb_state(
             expert_load_view,
             logical_to_physical_map,
             logical_replica_count,
-            expert_load_fgate,
+            expert_load_fgate=expert_load_fgate,
+            fgate_skip_prefill=fgate_skip_prefill,
         )
         self.expert_weights = self.language_model.expert_weights
 

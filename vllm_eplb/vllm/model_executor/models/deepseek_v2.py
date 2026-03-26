@@ -36,6 +36,7 @@ import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -368,13 +369,19 @@ class DeepseekV2MoE(nn.Module):
                 getattr(self.experts, "next_gate_weight", None) is not None
                 and getattr(self.experts, "expert_load_fgate_view", None) is not None
             ):
-                with torch.no_grad():
-                    pred_logits = torch.nn.functional.linear(
-                        hidden_states, self.experts.next_gate_weight
-                    )
-                    pred_scores = pred_logits.float().softmax(dim=-1)
-                    pred_load = pred_scores.sum(dim=0)
-                    self.experts.expert_load_fgate_view.add_(pred_load)
+                skip_fgate = (
+                    getattr(self.experts, "fgate_skip_prefill", False)
+                    and is_forward_context_available()
+                    and get_forward_context().max_query_len > 1
+                )
+                if not skip_fgate:
+                    with torch.no_grad():
+                        pred_logits = torch.nn.functional.linear(
+                            hidden_states, self.experts.next_gate_weight
+                        )
+                        pred_scores = pred_logits.float().softmax(dim=-1)
+                        pred_load = pred_scores.sum(dim=0)
+                        self.experts.expert_load_fgate_view.add_(pred_load)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -1310,6 +1317,7 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         expert_load_fgate: torch.Tensor | None = None,
+        fgate_skip_prefill: bool = False,
     ) -> None:
         gate_weights: list[torch.Tensor] = []
         if expert_load_fgate is not None:
@@ -1329,6 +1337,7 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
                 logical_replica_count=logical_replica_count,
                 next_gate_weight=next_gate_weight,
                 expert_load_fgate_view=expert_load_fgate,
+                fgate_skip_prefill=fgate_skip_prefill,
             )
 
 

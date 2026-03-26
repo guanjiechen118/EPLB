@@ -395,6 +395,7 @@ class FusedMoE(CustomOp):
         self.eplb_state = EplbLayerState()
         self.next_gate_weight: torch.Tensor | None = None
         self.expert_load_fgate_view: torch.Tensor | None = None
+        self.fgate_skip_prefill: bool = False
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
@@ -1454,6 +1455,7 @@ class FusedMoE(CustomOp):
         logical_replica_count: torch.Tensor,
         next_gate_weight: torch.Tensor | None = None,
         expert_load_fgate_view: torch.Tensor | None = None,
+        fgate_skip_prefill: bool = False,
     ) -> None:
         """
         Register the EPLB state in this layer.
@@ -1472,6 +1474,7 @@ class FusedMoE(CustomOp):
         )
         self.next_gate_weight = next_gate_weight
         self.expert_load_fgate_view = self.eplb_state.expert_load_fgate_view
+        self.fgate_skip_prefill = fgate_skip_prefill
 
     def ensure_moe_quant_config_init(self):
         if self.quant_method.moe_quant_config is None:

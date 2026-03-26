@@ -880,6 +880,7 @@ class MixtureOfExperts(Protocol):
         logical_to_physical_map: Tensor,
         logical_replica_count: Tensor,
         expert_load_fgate: Tensor | None = None,
+        fgate_skip_prefill: bool = False,
     ) -> None:
         """
         Register the EPLB state in the MoE model.
@@ -897,6 +898,7 @@ class MixtureOfExperts(Protocol):
             logical_to_physical_map: Mapping from logical to physical experts.
             logical_replica_count: Count of replicas for each logical expert.
             expert_load_fgate: fgate predicted load tensor (logical space).
+            fgate_skip_prefill: Whether to skip fgate prediction during prefill.
         """
         for layer_idx, layer in enumerate(self.moe_layers):
             # Register the expert weights.
@@ -907,6 +909,7 @@ class MixtureOfExperts(Protocol):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
                 expert_load_fgate_view=expert_load_fgate,
+                fgate_skip_prefill=fgate_skip_prefill,
             )
 
     def update_physical_experts_metadata(

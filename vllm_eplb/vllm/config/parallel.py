@@ -55,7 +55,7 @@ All2AllBackend = Literal[
 class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
 
-    algorithm: Literal["swm", "ema", "fgate"] = "swm"
+    algorithm: Literal["swm", "ema", "fgate", "fgate-v2"] = "swm"
     """Algorithm for EPLB load estimation.
 
     Supported values:
@@ -65,6 +65,8 @@ class EPLBConfig:
       (controlled by ``ema_alpha``) to weight recent observations more.
     - "fgate": Forward Gate. Predicts next layer's expert load by running
       current hidden states through the next layer's gate network.
+    - "fgate-v2": Forward Gate V2. Same as fgate but skips the prediction
+      computation during prefill batches (max_query_len > 1).
     """
 
     ema_alpha: float = 0.01
@@ -110,7 +112,7 @@ class EPLBConfig:
             raise ValueError("Async EPLB is only supported with the default policy.")
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
-        supported_eplb_algorithms = ("swm", "ema", "fgate")
+        supported_eplb_algorithms = ("swm", "ema", "fgate", "fgate-v2")
         if self.algorithm not in supported_eplb_algorithms:
             raise ValueError(
                 f"Unsupported EPLB algorithm '{self.algorithm}'. "
@@ -421,7 +423,7 @@ class ParallelConfig:
                     f"to be greater than 1, but got "
                     f"TP={self.tensor_parallel_size},DP={self.data_parallel_size}."
                 )
-            supported_eplb_algorithms = ("swm", "ema", "fgate")
+            supported_eplb_algorithms = ("swm", "ema", "fgate", "fgate-v2")
             if self.eplb_config.algorithm not in supported_eplb_algorithms:
                 raise ValueError(
                     f"Unsupported eplb_config.algorithm "

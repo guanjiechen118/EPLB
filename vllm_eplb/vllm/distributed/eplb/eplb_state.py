@@ -167,7 +167,7 @@ class EplbModelState:
     https://github.com/vllm-project/vllm/pull/22167#pullrequestreview-3086143856
     """
     eplb_algorithm: str
-    """Algorithm for load estimation: "swm", "ema", or "fgate"."""
+    """Algorithm for load estimation: "swm", "ema", "fgate", or "fgate-v2"."""
     eplb_ema_alpha: float
     """EMA decay factor. Only used when eplb_algorithm="ema"."""
     expert_load_ema: torch.Tensor | None
@@ -178,13 +178,13 @@ class EplbModelState:
     expert_load_fgate: torch.Tensor | None
     """
     fgate predicted expert load per step (logical expert space).
-    Only allocated when eplb_algorithm="fgate".
+    Only allocated when eplb_algorithm in ("fgate", "fgate-v2").
     Shape: (num_moe_layers, num_logical_experts)
     """
     expert_load_fgate_window: torch.Tensor | None
     """
     Sliding window for fgate predicted load (logical expert space).
-    Only allocated when eplb_algorithm="fgate".
+    Only allocated when eplb_algorithm in ("fgate", "fgate-v2").
     Shape: (window_size, num_moe_layers, num_logical_experts)
     """
     expert_load_fgate_window_step: int
@@ -496,7 +496,7 @@ class EplbState:
 
         expert_load_fgate: torch.Tensor | None = None
         expert_load_fgate_window: torch.Tensor | None = None
-        if eplb_algorithm == "fgate":
+        if eplb_algorithm in ("fgate", "fgate-v2"):
             expert_load_fgate = torch.zeros(
                 (model.num_moe_layers, model.num_logical_experts),
                 dtype=torch.float32,
@@ -540,6 +540,7 @@ class EplbState:
             logical_to_physical_map,
             logical_replica_count,
             expert_load_fgate=expert_load_fgate,
+            fgate_skip_prefill=(eplb_algorithm == "fgate-v2"),
         )
 
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
@@ -678,7 +679,7 @@ class EplbState:
                     eplb_model_state.expert_load_ema.mul_(1.0 - alpha).add_(
                         eplb_model_state.expert_load_pass.float(), alpha=alpha
                     )
-                elif eplb_model_state.eplb_algorithm == "fgate":
+                elif eplb_model_state.eplb_algorithm in ("fgate", "fgate-v2"):
                     assert eplb_model_state.expert_load_fgate is not None
                     assert eplb_model_state.expert_load_fgate_window is not None
                     eplb_model_state.expert_load_fgate_window[
@@ -783,7 +784,7 @@ class EplbState:
                     src=eplb_model_state.expert_load_ema,
                 )
                 global_expert_load_window = logical_expert_load
-            elif eplb_model_state.eplb_algorithm == "fgate":
+            elif eplb_model_state.eplb_algorithm in ("fgate", "fgate-v2"):
                 assert eplb_model_state.expert_load_fgate_window is not None
                 global_expert_load_window = (
                     eplb_model_state.expert_load_fgate_window.sum(dim=0).float()

@@ -40,6 +40,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -238,13 +239,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             getattr(self.experts, "next_gate_weight", None) is not None
             and getattr(self.experts, "expert_load_fgate_view", None) is not None
         ):
-            with torch.no_grad():
-                pred_logits = torch.nn.functional.linear(
-                    hidden_states, self.experts.next_gate_weight
-                )
-                pred_scores = pred_logits.float().softmax(dim=-1)
-                pred_load = pred_scores.sum(dim=0)
-                self.experts.expert_load_fgate_view.add_(pred_load)
+            skip_fgate = (
+                getattr(self.experts, "fgate_skip_prefill", False)
+                and is_forward_context_available()
+                and get_forward_context().max_query_len > 1
+            )
+            if not skip_fgate:
+                with torch.no_grad():
+                    pred_logits = torch.nn.functional.linear(
+                        hidden_states, self.experts.next_gate_weight
+                    )
+                    pred_scores = pred_logits.float().softmax(dim=-1)
+                    pred_load = pred_scores.sum(dim=0)
+                    self.experts.expert_load_fgate_view.add_(pred_load)
         shared_out, fused_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -774,6 +781,7 @@ class Qwen3MoeForCausalLM(
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         expert_load_fgate: torch.Tensor | None = None,
+        fgate_skip_prefill: bool = False,
     ) -> None:
         gate_weights: list[torch.Tensor] = []
         if expert_load_fgate is not None:
@@ -793,6 +801,7 @@ class Qwen3MoeForCausalLM(
                 logical_replica_count=logical_replica_count,
                 next_gate_weight=next_gate_weight,
                 expert_load_fgate_view=expert_load_fgate,
+                fgate_skip_prefill=fgate_skip_prefill,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

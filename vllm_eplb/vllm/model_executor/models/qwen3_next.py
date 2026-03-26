@@ -27,7 +27,11 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.forward_context import ForwardContext, get_forward_context
+from vllm.forward_context import (
+    ForwardContext,
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.attention import Attention
@@ -341,6 +345,24 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
+
+        if (
+            getattr(self.experts, "next_gate_weight", None) is not None
+            and getattr(self.experts, "expert_load_fgate_view", None) is not None
+        ):
+            skip_fgate = (
+                getattr(self.experts, "fgate_skip_prefill", False)
+                and is_forward_context_available()
+                and get_forward_context().max_query_len > 1
+            )
+            if not skip_fgate:
+                with torch.no_grad():
+                    pred_logits = torch.nn.functional.linear(
+                        hidden_states, self.experts.next_gate_weight
+                    )
+                    pred_scores = pred_logits.float().softmax(dim=-1)
+                    pred_load = pred_scores.sum(dim=0)
+                    self.experts.expert_load_fgate_view.add_(pred_load)
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
@@ -1503,6 +1525,40 @@ class Qwen3NextModel(nn.Module):
 
 
 class QwenNextMixtureOfExperts(MixtureOfExperts):
+    def set_eplb_state(
+        self,
+        expert_load_view: torch.Tensor,
+        logical_to_physical_map: torch.Tensor,
+        logical_replica_count: torch.Tensor,
+        expert_load_fgate: torch.Tensor | None = None,
+        fgate_skip_prefill: bool = False,
+    ) -> None:
+        gate_weights: list[torch.Tensor] = []
+        if expert_load_fgate is not None:
+            gate_weights = [
+                layer.mlp.gate.weight
+                for layer in self.model.layers
+                if isinstance(layer, Qwen3NextDecoderLayer)
+                and isinstance(layer.mlp, Qwen3NextSparseMoeBlock)
+            ]
+
+        for layer_idx, layer in enumerate(self.moe_layers):
+            self.expert_weights.append(layer.get_expert_weights())
+
+            next_gate_weight = None
+            if gate_weights:
+                next_gate_weight = gate_weights[min(layer_idx + 1, len(gate_weights) - 1)]
+
+            layer.set_eplb_state(
+                moe_layer_idx=layer_idx,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+                next_gate_weight=next_gate_weight,
+                expert_load_fgate_view=expert_load_fgate,
+                fgate_skip_prefill=fgate_skip_prefill,
+            )
+
     def update_physical_experts_metadata(
         self,
         num_physical_experts: int,

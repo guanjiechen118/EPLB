@@ -6,7 +6,7 @@ EXPERIMENT_NAME="baseline-EP"
 export PATH=/usr/local/bin:$PATH
 export PATH=/usr/local/cuda-12.6/bin:$PATH
 export PATH=/usr/local/nvidia/bin:$PATH
-export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/usr/local/nvidia/lib64
 export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
 
 MODEL=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3-Base/snapshots/afb92e1fa402c2be2a9eb085312bb02e0384d6c7
