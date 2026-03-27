@@ -1549,9 +1549,24 @@ class FusedMoE(CustomOp):
         # - `expert_id` is the physical expert id
         # - `weight_name` contains the weight name of the logical expert
         # So that we should map the expert id to logical in `weight_name`
+        vllm_config = get_current_vllm_config()
+        parallel_config = vllm_config.parallel_config if vllm_config is not None else None
+        eplb_algorithm = (
+            parallel_config.eplb_config.algorithm
+            if parallel_config is not None and parallel_config.enable_eplb
+            else "swm"
+        )
+        ep_size = (
+            parallel_config.tensor_parallel_size * parallel_config.data_parallel_size
+            if parallel_config is not None
+            else None
+        )
         physical_to_logical_map = (
             EplbState.build_initial_global_physical_to_logical_map(
-                num_experts, num_redundant_experts
+                num_experts,
+                num_redundant_experts,
+                ep_size=ep_size,
+                balance_redundant=(eplb_algorithm == "fgate-peer-cache"),
             )
         )
 

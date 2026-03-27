@@ -24,6 +24,12 @@ RESULTS_DIR=${ROOT_DIR}/results
 mkdir -p "${RESULTS_DIR}"
 LOG_FILE=${RESULTS_DIR}/server_${MODEL_TAG}_${EPLB_ALGO}.log
 
+EP_SIZE=$((TP_SIZE * DP_SIZE))
+if [[ "${EPLB_ALGO}" == "fgate-peer-cache" ]] && (( NUM_REDUNDANT_EXPERTS % EP_SIZE != 0 )); then
+  echo "fgate-peer-cache requires NUM_REDUNDANT_EXPERTS divisible by EP_SIZE=${EP_SIZE}" >&2
+  exit 1
+fi
+
 EPLB_ARGS=()
 if [[ "${ENABLE_EPLB}" == "1" ]]; then
   export EPLB_ALGO WINDOW_SIZE STEP_INTERVAL NUM_REDUNDANT_EXPERTS LOG_BALANCEDNESS

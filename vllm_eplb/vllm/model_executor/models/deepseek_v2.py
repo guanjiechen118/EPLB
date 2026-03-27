@@ -36,7 +36,10 @@ import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ParallelConfig, VllmConfig, get_current_vllm_config
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import (
+    get_forward_context_max_query_len,
+    is_forward_context_available,
+)
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -372,7 +375,7 @@ class DeepseekV2MoE(nn.Module):
                 skip_fgate = (
                     getattr(self.experts, "fgate_skip_prefill", False)
                     and is_forward_context_available()
-                    and get_forward_context().max_query_len > 1
+                    and get_forward_context_max_query_len() > 1
                 )
                 if not skip_fgate:
                     with torch.no_grad():

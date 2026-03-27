@@ -262,6 +262,31 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def get_forward_context_max_query_len(default: int = 1) -> int:
+    """Best-effort access to the current batch max_query_len."""
+    ctx = get_forward_context()
+
+    attn_metadata = ctx.attn_metadata
+    if attn_metadata is None:
+        return default
+    metadata_values: list[Any] = []
+    if isinstance(attn_metadata, list):
+        for metadata_dict in attn_metadata:
+            metadata_values.extend(metadata_dict.values())
+    else:
+        metadata_values.extend(attn_metadata.values())
+
+    for metadata in metadata_values:
+        max_query_len = getattr(metadata, "max_query_len", None)
+        if max_query_len is not None:
+            return int(max_query_len)
+
+    maybe_extra = ctx.additional_kwargs.get("max_query_len")
+    if maybe_extra is not None:
+        return int(maybe_extra)
+    return default
+
+
 def create_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,

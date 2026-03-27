@@ -407,6 +407,22 @@ class GPUModelRunner(
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
+        if (
+            parallel_config.enable_eplb
+            and parallel_config.eplb_config.algorithm == "fgate-peer-cache"
+        ):
+            if self.compilation_config.mode != CompilationMode.NONE:
+                logger.warning(
+                    "fgate-peer-cache is forcing CompilationMode.NONE for stability."
+                )
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.compile_sizes = []
+            if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                logger.warning(
+                    "fgate-peer-cache is forcing cudagraph_mode=NONE for stability."
+                )
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                self.compilation_config.cudagraph_capture_sizes = []
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype

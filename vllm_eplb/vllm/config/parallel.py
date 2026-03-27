@@ -55,7 +55,9 @@ All2AllBackend = Literal[
 class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
 
-    algorithm: Literal["swm", "ema", "fgate", "fgate-v2"] = "swm"
+    algorithm: Literal[
+        "swm", "ema", "fgate", "fgate-v2", "fgate-peer-cache"
+    ] = "swm"
     """Algorithm for EPLB load estimation.
 
     Supported values:
@@ -67,6 +69,13 @@ class EPLBConfig:
       current hidden states through the next layer's gate network.
     - "fgate-v2": Forward Gate V2. Same as fgate but skips the prediction
       computation during prefill batches (max_query_len > 1).
+    - "fgate-peer-cache": Uses fgate predicted logical-expert demand to
+      refresh only the redundant expert slots as a same-node peer-GPU cache.
+      Primary expert slots remain fixed while redundant slots are repopulated
+      by peer-to-peer expert weight copies. When ``data_parallel_size=1`` the
+      refresh can run on the immediate decode fast path; otherwise it falls
+      back to periodic refresh controlled by ``window_size``/``step_interval``
+      to avoid deadlocks across unsynchronized DP workers.
     """
 
     ema_alpha: float = 0.01
@@ -112,11 +121,22 @@ class EPLBConfig:
             raise ValueError("Async EPLB is only supported with the default policy.")
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
-        supported_eplb_algorithms = ("swm", "ema", "fgate", "fgate-v2")
+        supported_eplb_algorithms = (
+            "swm",
+            "ema",
+            "fgate",
+            "fgate-v2",
+            "fgate-peer-cache",
+        )
         if self.algorithm not in supported_eplb_algorithms:
             raise ValueError(
                 f"Unsupported EPLB algorithm '{self.algorithm}'. "
                 f"Supported: {supported_eplb_algorithms}."
+            )
+        if self.algorithm == "fgate-peer-cache" and self.use_async:
+            raise ValueError(
+                "fgate-peer-cache currently only supports synchronous EPLB "
+                "(use_async=False)."
             )
         if self.algorithm == "ema" and not (0 < self.ema_alpha < 1):
             raise ValueError(
@@ -423,13 +443,37 @@ class ParallelConfig:
                     f"to be greater than 1, but got "
                     f"TP={self.tensor_parallel_size},DP={self.data_parallel_size}."
                 )
-            supported_eplb_algorithms = ("swm", "ema", "fgate", "fgate-v2")
+            supported_eplb_algorithms = (
+                "swm",
+                "ema",
+                "fgate",
+                "fgate-v2",
+                "fgate-peer-cache",
+            )
             if self.eplb_config.algorithm not in supported_eplb_algorithms:
                 raise ValueError(
                     f"Unsupported eplb_config.algorithm "
                     f"'{self.eplb_config.algorithm}'. Supported: "
                     f"{supported_eplb_algorithms}."
                 )
+            if self.eplb_config.algorithm == "fgate-peer-cache":
+                ep_size = self.tensor_parallel_size * self.data_parallel_size
+                if self.eplb_config.num_redundant_experts <= 0:
+                    raise ValueError(
+                        "fgate-peer-cache requires "
+                        "eplb_config.num_redundant_experts > 0."
+                    )
+                if self.eplb_config.num_redundant_experts % ep_size != 0:
+                    raise ValueError(
+                        "fgate-peer-cache requires "
+                        "eplb_config.num_redundant_experts to be divisible by "
+                        f"the EP size ({ep_size}), but got "
+                        f"{self.eplb_config.num_redundant_experts}."
+                    )
+                if self.eplb_config.use_async:
+                    raise ValueError(
+                        "fgate-peer-cache does not support async EPLB yet."
+                    )
             if self.eplb_config.algorithm == "ema" and not (
                 0 < self.eplb_config.ema_alpha < 1
             ):

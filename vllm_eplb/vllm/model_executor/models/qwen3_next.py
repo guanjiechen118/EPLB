@@ -30,6 +30,7 @@ from vllm.distributed import (
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
+    get_forward_context_max_query_len,
     is_forward_context_available,
 )
 from vllm.logger import init_logger
@@ -353,7 +354,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             skip_fgate = (
                 getattr(self.experts, "fgate_skip_prefill", False)
                 and is_forward_context_available()
-                and get_forward_context().max_query_len > 1
+                and get_forward_context_max_query_len() > 1
             )
             if not skip_fgate:
                 with torch.no_grad():

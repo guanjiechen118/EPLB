@@ -40,7 +40,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.forward_context import (
+    get_forward_context_max_query_len,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
@@ -242,7 +245,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             skip_fgate = (
                 getattr(self.experts, "fgate_skip_prefill", False)
                 and is_forward_context_available()
-                and get_forward_context().max_query_len > 1
+                and get_forward_context_max_query_len() > 1
             )
             if not skip_fgate:
                 with torch.no_grad():

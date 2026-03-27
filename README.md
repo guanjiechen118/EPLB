@@ -8,7 +8,7 @@
 
 ## fgate / fgate-v2
 
-`vllm_eplb` now supports EPLB `fgate` and `fgate-v2` for:
+`vllm_eplb` now supports EPLB `fgate`, `fgate-v2`, and `fgate-peer-cache` for:
 
 - DeepSeek-V2-Lite (`DeepseekV2ForCausalLM`)
 - Qwen3-30B-A3B (`Qwen3MoeForCausalLM`)
@@ -18,6 +18,7 @@
 
 - `fgate`: after the current layer finishes routing, use the current hidden states and the **next** MoE gate to predict the next-layer expert load, then feed that prediction into EPLB.
 - `fgate-v2`: same as `fgate`, but skips the prediction during prefill (`max_query_len > 1`) and only accumulates predicted load during decode. This reduces prefill overhead for long-context serving.
+- `fgate-peer-cache`: same-node peer-GPU predictive replication for redundant expert slots. Primary slots stay fixed; only redundant slots are refreshed from peer GPUs using fgate-predicted logical demand. This currently requires `num_redundant_experts` to be divisible by the EP size and is intended for single-node runs. With `data_parallel_size=1` it can use the immediate decode fast path; with `data_parallel_size>1` it safely falls back to periodic refresh driven by `window_size` / `step_interval`.
 
 Example `eplb-config` values:
 
@@ -25,6 +26,8 @@ Example `eplb-config` values:
 --enable-eplb --eplb-config '{"algorithm":"fgate","window_size":1000,"step_interval":1000,"num_redundant_experts":2,"log_balancedness":true}'
 
 --enable-eplb --eplb-config '{"algorithm":"fgate-v2","window_size":1000,"step_interval":1000,"num_redundant_experts":2,"log_balancedness":true}'
+
+--enable-eplb --eplb-config '{"algorithm":"fgate-peer-cache","window_size":1000,"step_interval":1000,"num_redundant_experts":8,"log_balancedness":true}'
 ```
 
 ## scripts
