@@ -56,7 +56,12 @@ class EPLBConfig:
     """Configuration for Expert Parallel Load Balancing (EP)."""
 
     algorithm: Literal[
-        "swm", "ema", "fgate", "fgate-v2", "fgate-peer-cache"
+        "swm",
+        "ema",
+        "fgate",
+        "fgate-v2",
+        "fgate-peer-cache",
+        "fgate-hybrid-cache",
     ] = "swm"
     """Algorithm for EPLB load estimation.
 
@@ -76,6 +81,11 @@ class EPLBConfig:
       refresh can run on the immediate decode fast path; otherwise it falls
       back to periodic refresh controlled by ``window_size``/``step_interval``
       to avoid deadlocks across unsynchronized DP workers.
+    - "fgate-hybrid-cache": Same-node hybrid peer cache. Primary expert slots
+      remain fixed, a configurable subset of redundant slots is refreshed by a
+      slow EMA path, and the remaining redundant slots are split into two
+      double-buffered fgate banks so that one bank can stay compute-visible
+      while the other is repopulated for the next round.
     """
 
     ema_alpha: float = 0.01
@@ -97,6 +107,15 @@ class EPLBConfig:
 
     num_redundant_experts: int = Field(default=0, ge=0)
     """Number of redundant experts to use for expert parallelism."""
+
+    num_static_redundant_experts: int = Field(default=0, ge=0)
+    """
+    Number of redundant experts reserved for the slow/static EMA-managed cache.
+
+    Only used when ``algorithm="fgate-hybrid-cache"``. A value of ``0`` means
+    "auto": use half of ``num_redundant_experts`` (rounded down), subject to
+    the EP divisibility constraints required by the hybrid layout.
+    """
 
     log_balancedness: bool = False
     """
@@ -127,6 +146,7 @@ class EPLBConfig:
             "fgate",
             "fgate-v2",
             "fgate-peer-cache",
+            "fgate-hybrid-cache",
         )
         if self.algorithm not in supported_eplb_algorithms:
             raise ValueError(
@@ -138,11 +158,25 @@ class EPLBConfig:
                 "fgate-peer-cache currently only supports synchronous EPLB "
                 "(use_async=False)."
             )
+        if self.algorithm == "fgate-hybrid-cache" and self.use_async:
+            raise ValueError(
+                "fgate-hybrid-cache currently only supports synchronous EPLB "
+                "(use_async=False)."
+            )
         if self.algorithm == "ema" and not (0 < self.ema_alpha < 1):
             raise ValueError(
                 f"ema_alpha must be in (0, 1), but got {self.ema_alpha}."
             )
         return self
+
+    def resolved_static_redundant_experts(self) -> int:
+        if self.algorithm != "fgate-hybrid-cache":
+            return 0
+        if self.num_redundant_experts <= 0:
+            return 0
+        if self.num_static_redundant_experts > 0:
+            return self.num_static_redundant_experts
+        return self.num_redundant_experts // 2
 
 
 @config
@@ -449,6 +483,7 @@ class ParallelConfig:
                 "fgate",
                 "fgate-v2",
                 "fgate-peer-cache",
+                "fgate-hybrid-cache",
             )
             if self.eplb_config.algorithm not in supported_eplb_algorithms:
                 raise ValueError(
@@ -473,6 +508,49 @@ class ParallelConfig:
                 if self.eplb_config.use_async:
                     raise ValueError(
                         "fgate-peer-cache does not support async EPLB yet."
+                    )
+            if self.eplb_config.algorithm == "fgate-hybrid-cache":
+                ep_size = self.tensor_parallel_size * self.data_parallel_size
+                if self.eplb_config.num_redundant_experts <= 0:
+                    raise ValueError(
+                        "fgate-hybrid-cache requires "
+                        "eplb_config.num_redundant_experts > 0."
+                    )
+                static_redundant = (
+                    self.eplb_config.resolved_static_redundant_experts()
+                )
+                if static_redundant <= 0:
+                    raise ValueError(
+                        "fgate-hybrid-cache requires at least one static "
+                        "redundant expert slot; set "
+                        "eplb_config.num_static_redundant_experts or increase "
+                        "eplb_config.num_redundant_experts."
+                    )
+                if static_redundant >= self.eplb_config.num_redundant_experts:
+                    raise ValueError(
+                        "fgate-hybrid-cache requires at least one dynamic "
+                        "redundant expert slot in addition to the static slots."
+                    )
+                if static_redundant % ep_size != 0:
+                    raise ValueError(
+                        "fgate-hybrid-cache requires "
+                        "eplb_config.num_static_redundant_experts to be "
+                        f"divisible by the EP size ({ep_size}), but got "
+                        f"{static_redundant}."
+                    )
+                dynamic_redundant = (
+                    self.eplb_config.num_redundant_experts - static_redundant
+                )
+                if dynamic_redundant % (2 * ep_size) != 0:
+                    raise ValueError(
+                        "fgate-hybrid-cache requires the dynamic redundant "
+                        "expert slots to be evenly split across two banks on "
+                        f"each EP rank; got dynamic slots={dynamic_redundant} "
+                        f"for EP size {ep_size}."
+                    )
+                if self.eplb_config.use_async:
+                    raise ValueError(
+                        "fgate-hybrid-cache does not support async EPLB yet."
                     )
             if self.eplb_config.algorithm == "ema" and not (
                 0 < self.eplb_config.ema_alpha < 1

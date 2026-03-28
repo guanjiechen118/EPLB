@@ -1566,7 +1566,9 @@ class FusedMoE(CustomOp):
                 num_experts,
                 num_redundant_experts,
                 ep_size=ep_size,
-                balance_redundant=(eplb_algorithm == "fgate-peer-cache"),
+                balance_redundant=(
+                    eplb_algorithm in ("fgate-peer-cache", "fgate-hybrid-cache")
+                ),
             )
         )
 

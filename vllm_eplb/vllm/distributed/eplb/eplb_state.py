@@ -175,11 +175,17 @@ class EplbModelState:
     EMA-smoothed expert load. Only allocated when eplb_algorithm="ema".
     Shape: (num_moe_layers, num_physical_experts)
     """
+    expert_load_logical_ema: torch.Tensor | None
+    """
+    EMA-smoothed logical expert load.
+    Only allocated when eplb_algorithm="fgate-hybrid-cache".
+    Shape: (num_moe_layers, num_logical_experts)
+    """
     expert_load_fgate: torch.Tensor | None
     """
     fgate predicted expert load per step (logical expert space).
     Only allocated when eplb_algorithm in
-    ("fgate", "fgate-v2", "fgate-peer-cache").
+    ("fgate", "fgate-v2", "fgate-peer-cache", "fgate-hybrid-cache").
     Shape: (num_moe_layers, num_logical_experts)
     """
     expert_load_fgate_window: torch.Tensor | None
@@ -284,6 +290,27 @@ class EplbModelState:
     """
     For fgate-peer-cache, the primary/home rank for each logical expert.
     Shape: (num_logical_experts,)
+    """
+    peer_cache_primary_physical_to_logical_map: torch.Tensor | None = None
+    """
+    For fgate-hybrid-cache, the immutable primary/home logical layout without
+    any redundant overlay slots.
+    """
+    peer_cache_static_physical_ids: torch.Tensor | None = None
+    """
+    For fgate-hybrid-cache, the physical expert ids reserved as EMA-managed
+    static redundant slots.
+    """
+    peer_cache_dynamic_bank_physical_ids: torch.Tensor | None = None
+    """
+    For fgate-hybrid-cache, the physical expert ids reserved as the two
+    double-buffered dynamic banks.
+    Shape: (2, num_bank_slots)
+    """
+    peer_cache_active_dynamic_bank_idx: torch.Tensor | None = None
+    """
+    For fgate-hybrid-cache, the active dynamic bank index for each layer.
+    Shape: (num_moe_layers,)
     """
 
 
@@ -452,6 +479,93 @@ class EplbState:
             )
         return torch.tensor(dynamic_ids, dtype=torch.long)
 
+    @staticmethod
+    def get_hybrid_peer_cache_physical_ids(
+        num_logical_experts: int,
+        num_physical_experts: int,
+        ep_size: int,
+        num_static_redundant_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dynamic_ids = EplbState.get_peer_cache_dynamic_physical_ids(
+            num_logical_experts=num_logical_experts,
+            num_physical_experts=num_physical_experts,
+            ep_size=ep_size,
+        )
+        if dynamic_ids.numel() == 0:
+            return (
+                torch.empty((0,), dtype=torch.long),
+                torch.empty((2, 0), dtype=torch.long),
+            )
+
+        if (
+            num_static_redundant_experts < 0
+            or num_static_redundant_experts > dynamic_ids.numel()
+        ):
+            raise ValueError(
+                "Invalid hybrid peer-cache static slot count: "
+                f"{num_static_redundant_experts} for {dynamic_ids.numel()} redundant "
+                "slots."
+            )
+
+        num_static_per_rank = num_static_redundant_experts // max(1, ep_size)
+        dynamic_ids_per_rank = dynamic_ids.numel() // max(1, ep_size)
+        remaining_dynamic_per_rank = dynamic_ids_per_rank - num_static_per_rank
+        if remaining_dynamic_per_rank < 0 or remaining_dynamic_per_rank % 2 != 0:
+            raise ValueError(
+                "Hybrid peer-cache requires the dynamic slots on each EP rank "
+                "to be splittable into two equal banks."
+            )
+
+        static_ids: list[int] = []
+        bank0_ids: list[int] = []
+        bank1_ids: list[int] = []
+        for rank in range(max(1, ep_size)):
+            rank_dynamic = dynamic_ids[
+                rank * dynamic_ids_per_rank : (rank + 1) * dynamic_ids_per_rank
+            ]
+            static_end = num_static_per_rank
+            bank_mid = static_end + remaining_dynamic_per_rank // 2
+            static_ids.extend(rank_dynamic[:static_end].tolist())
+            bank0_ids.extend(rank_dynamic[static_end:bank_mid].tolist())
+            bank1_ids.extend(rank_dynamic[bank_mid:].tolist())
+
+        return (
+            torch.tensor(static_ids, dtype=torch.long),
+            torch.stack(
+                (
+                    torch.tensor(bank0_ids, dtype=torch.long),
+                    torch.tensor(bank1_ids, dtype=torch.long),
+                )
+            ),
+        )
+
+    @staticmethod
+    def build_logical_mapping_from_physical_subset(
+        physical_to_logical_map: torch.Tensor,
+        included_physical_ids: torch.Tensor,
+        num_logical_experts: int,
+        max_slots_per_logical_expert: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        logical_to_physical_map = torch.full(
+            (num_logical_experts, max_slots_per_logical_expert),
+            -1,
+            device=physical_to_logical_map.device,
+            dtype=torch.long,
+        )
+        logical_replica_count = torch.zeros(
+            (num_logical_experts,),
+            device=physical_to_logical_map.device,
+            dtype=torch.long,
+        )
+        for physical_idx in included_physical_ids.detach().cpu().tolist():
+            logical_idx = int(physical_to_logical_map[physical_idx].item())
+            if logical_idx < 0:
+                continue
+            replica_idx = int(logical_replica_count[logical_idx].item())
+            logical_to_physical_map[logical_idx, replica_idx] = int(physical_idx)
+            logical_replica_count[logical_idx] += 1
+        return logical_to_physical_map, logical_replica_count
+
     def validate_ep_configuration(self, new_model: MixtureOfExperts):
         """
         Validate that the expert parallel configuration of
@@ -487,6 +601,73 @@ class EplbState:
                         new_model.num_expert_groups,
                     )
                 )
+
+    @staticmethod
+    def _logical_expert_load_from_physical(
+        physical_load: torch.Tensor,
+        physical_to_logical_map: torch.Tensor,
+        num_logical_experts: int,
+    ) -> torch.Tensor:
+        logical_load = torch.zeros(
+            physical_load.shape[0],
+            num_logical_experts,
+            dtype=torch.float32,
+            device=physical_load.device,
+        )
+        logical_load.scatter_add_(
+            dim=-1,
+            index=physical_to_logical_map.long(),
+            src=physical_load.float(),
+        )
+        return logical_load
+
+    def _build_hybrid_peer_cache_runtime_logical_mapping(
+        self,
+        model_state: EplbModelState,
+        physical_to_logical_map: torch.Tensor,
+        active_dynamic_bank_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert model_state.peer_cache_primary_physical_to_logical_map is not None
+        assert model_state.peer_cache_static_physical_ids is not None
+        assert model_state.peer_cache_dynamic_bank_physical_ids is not None
+
+        num_physical_experts = physical_to_logical_map.shape[1]
+        base_mask = torch.ones(
+            (num_physical_experts,),
+            dtype=torch.bool,
+            device=physical_to_logical_map.device,
+        )
+        dynamic_ids = model_state.peer_cache_dynamic_bank_physical_ids.reshape(-1).long()
+        if dynamic_ids.numel() > 0:
+            base_mask[dynamic_ids] = False
+        static_ids = model_state.peer_cache_static_physical_ids.long()
+        if static_ids.numel() > 0:
+            base_mask[static_ids] = True
+        base_physical_ids = torch.nonzero(base_mask, as_tuple=False).flatten()
+
+        max_slots_per_logical_expert = model_state.logical_to_physical_map.shape[-1]
+        logical_to_physical_map = torch.full_like(model_state.logical_to_physical_map, -1)
+        logical_replica_count = torch.zeros_like(model_state.logical_replica_count)
+
+        for layer_idx in range(model_state.model.num_moe_layers):
+            included_ids = base_physical_ids
+            active_bank = int(active_dynamic_bank_idx[layer_idx].item())
+            active_ids = model_state.peer_cache_dynamic_bank_physical_ids[active_bank].long()
+            if active_ids.numel() > 0:
+                included_ids = torch.cat((included_ids, active_ids))
+            (
+                layer_logical_to_physical,
+                layer_logical_replica_count,
+            ) = self.build_logical_mapping_from_physical_subset(
+                physical_to_logical_map=physical_to_logical_map[layer_idx].long(),
+                included_physical_ids=included_ids,
+                num_logical_experts=model_state.model.num_logical_experts,
+                max_slots_per_logical_expert=max_slots_per_logical_expert,
+            )
+            logical_to_physical_map[layer_idx].copy_(layer_logical_to_physical)
+            logical_replica_count[layer_idx].copy_(layer_logical_replica_count)
+
+        return logical_to_physical_map, logical_replica_count
 
     @staticmethod
     def _assign_peer_cache_dynamic_slots(
@@ -584,6 +765,200 @@ class EplbState:
             new_physical_to_logical_map,
             new_logical_to_physical_map,
             new_logical_replica_count,
+        )
+
+    def _build_hybrid_peer_cache_static_mapping(
+        self,
+        model_state: EplbModelState,
+        global_logical_ema_load: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert model_state.peer_cache_static_physical_ids is not None
+        assert model_state.peer_cache_active_dynamic_bank_idx is not None
+        assert model_state.peer_cache_home_rank is not None
+
+        new_physical_to_logical_map = model_state.physical_to_logical_map.clone()
+        static_ids = model_state.peer_cache_static_physical_ids.long()
+        if static_ids.numel() == 0 or not torch.count_nonzero(global_logical_ema_load):
+            return (
+                new_physical_to_logical_map,
+                model_state.logical_to_physical_map.clone(),
+                model_state.logical_replica_count.clone(),
+            )
+
+        num_logical_experts = model_state.model.num_logical_experts
+        desired_phy2log_np, _, _ = DefaultEplbPolicy.replicate_experts(
+            global_logical_ema_load.float().cpu().numpy(),
+            num_logical_experts + static_ids.numel(),
+        )
+        desired_static_np = desired_phy2log_np[:, num_logical_experts:].astype(np.int64)
+        current_static_np = (
+            model_state.physical_to_logical_map[:, static_ids].cpu().numpy().astype(np.int64)
+        )
+
+        num_local_physical_experts = model_state.model.num_local_physical_experts
+        slot_ranks = (
+            static_ids.cpu().numpy() // max(1, num_local_physical_experts)
+        ).astype(np.int64)
+        home_ranks = model_state.peer_cache_home_rank.cpu().numpy().astype(np.int64)
+
+        for layer_idx in range(model_state.model.num_moe_layers):
+            assigned = self._assign_peer_cache_dynamic_slots(
+                desired_logical_ids=desired_static_np[layer_idx],
+                current_logical_ids=current_static_np[layer_idx],
+                slot_ranks=slot_ranks,
+                home_ranks=home_ranks,
+            )
+            new_physical_to_logical_map[layer_idx, static_ids] = torch.from_numpy(
+                assigned
+            ).to(new_physical_to_logical_map.device)
+
+        (
+            new_logical_to_physical_map,
+            new_logical_replica_count,
+        ) = self._build_hybrid_peer_cache_runtime_logical_mapping(
+            model_state=model_state,
+            physical_to_logical_map=new_physical_to_logical_map,
+            active_dynamic_bank_idx=model_state.peer_cache_active_dynamic_bank_idx,
+        )
+        return (
+            new_physical_to_logical_map,
+            new_logical_to_physical_map,
+            new_logical_replica_count,
+        )
+
+    def _build_hybrid_peer_cache_fast_refresh(
+        self,
+        model_state: EplbModelState,
+        global_predicted_load: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        assert model_state.peer_cache_static_physical_ids is not None
+        assert model_state.peer_cache_dynamic_bank_physical_ids is not None
+        assert model_state.peer_cache_active_dynamic_bank_idx is not None
+        assert model_state.peer_cache_home_rank is not None
+
+        new_physical_to_logical_map = model_state.physical_to_logical_map.clone()
+        new_active_dynamic_bank_idx = (
+            model_state.peer_cache_active_dynamic_bank_idx.clone()
+        )
+        layer_changed_slots = torch.zeros(
+            (model_state.model.num_moe_layers,),
+            dtype=torch.long,
+            device=self.device,
+        )
+        layer_swap_mask = torch.zeros(
+            (model_state.model.num_moe_layers,),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        bank_ids = model_state.peer_cache_dynamic_bank_physical_ids.long()
+        if bank_ids.numel() == 0 or not torch.count_nonzero(global_predicted_load):
+            return (
+                new_physical_to_logical_map,
+                model_state.logical_to_physical_map.clone(),
+                model_state.logical_replica_count.clone(),
+                new_active_dynamic_bank_idx,
+                layer_swap_mask,
+                layer_changed_slots,
+            )
+
+        num_logical_experts = model_state.model.num_logical_experts
+        num_local_physical_experts = model_state.model.num_local_physical_experts
+        static_ids = model_state.peer_cache_static_physical_ids.long()
+        static_logicals = (
+            model_state.physical_to_logical_map[:, static_ids]
+            if static_ids.numel() > 0
+            else None
+        )
+        home_ranks = model_state.peer_cache_home_rank.cpu().numpy().astype(np.int64)
+        slot_ranks = [
+            (bank_ids[bank_idx].cpu().numpy() // max(1, num_local_physical_experts)).astype(
+                np.int64
+            )
+            for bank_idx in range(2)
+        ]
+
+        for layer_idx in range(model_state.model.num_moe_layers):
+            dynamic_weight = global_predicted_load[layer_idx].clone()
+            if static_logicals is not None:
+                covered_static = torch.unique(static_logicals[layer_idx].long())
+                covered_static = covered_static[covered_static >= 0]
+                if covered_static.numel() > 0:
+                    dynamic_weight[covered_static] = 0
+            if not torch.count_nonzero(dynamic_weight):
+                continue
+
+            desired_phy2log_np, _, _ = DefaultEplbPolicy.replicate_experts(
+                dynamic_weight.unsqueeze(0).float().cpu().numpy(),
+                num_logical_experts + bank_ids.shape[1],
+            )
+            desired_dynamic_ids = desired_phy2log_np[0, num_logical_experts:].astype(
+                np.int64
+            )
+
+            active_bank = int(model_state.peer_cache_active_dynamic_bank_idx[layer_idx].item())
+            standby_bank = 1 - active_bank
+            active_ids = bank_ids[active_bank]
+            standby_ids = bank_ids[standby_bank]
+
+            active_current = (
+                model_state.physical_to_logical_map[layer_idx, active_ids]
+                .cpu()
+                .numpy()
+                .astype(np.int64)
+            )
+            active_assigned = self._assign_peer_cache_dynamic_slots(
+                desired_logical_ids=desired_dynamic_ids,
+                current_logical_ids=active_current,
+                slot_ranks=slot_ranks[active_bank],
+                home_ranks=home_ranks,
+            )
+            if np.array_equal(active_assigned, active_current):
+                continue
+
+            standby_current = (
+                model_state.physical_to_logical_map[layer_idx, standby_ids]
+                .cpu()
+                .numpy()
+                .astype(np.int64)
+            )
+            standby_assigned = self._assign_peer_cache_dynamic_slots(
+                desired_logical_ids=desired_dynamic_ids,
+                current_logical_ids=standby_current,
+                slot_ranks=slot_ranks[standby_bank],
+                home_ranks=home_ranks,
+            )
+            changed_slots = int(np.count_nonzero(standby_assigned != standby_current))
+            if changed_slots > 0:
+                new_physical_to_logical_map[layer_idx, standby_ids] = torch.from_numpy(
+                    standby_assigned
+                ).to(new_physical_to_logical_map.device)
+            layer_changed_slots[layer_idx] = changed_slots
+            layer_swap_mask[layer_idx] = True
+            new_active_dynamic_bank_idx[layer_idx] = standby_bank
+
+        (
+            new_logical_to_physical_map,
+            new_logical_replica_count,
+        ) = self._build_hybrid_peer_cache_runtime_logical_mapping(
+            model_state=model_state,
+            physical_to_logical_map=new_physical_to_logical_map,
+            active_dynamic_bank_idx=new_active_dynamic_bank_idx,
+        )
+        return (
+            new_physical_to_logical_map,
+            new_logical_to_physical_map,
+            new_logical_replica_count,
+            new_active_dynamic_bank_idx,
+            layer_swap_mask,
+            layer_changed_slots,
         )
 
     def _run_peer_cache_fast_path(
@@ -731,6 +1106,184 @@ class EplbState:
                 new_logical_replica_count[changed_layers]
             )
 
+    def _step_hybrid_peer_cache(
+        self,
+        is_dummy: bool = False,
+        is_profile: bool = False,
+        log_stats: bool = False,
+    ) -> None:
+        ep_group = get_ep_group().device_group
+        if is_profile:
+            self.rearrange(is_profile=True)
+            return
+
+        if (
+            log_stats
+            and self.expert_rearrangement_step
+            % self.parallel_config.eplb_config.log_balancedness_interval
+            == 0
+        ):
+            expert_load_pass_list = self._sync_load_pass()
+            for expert_load_pass, eplb_model_state in zip(
+                expert_load_pass_list, self.model_states.values()
+            ):
+                num_tokens_per_rank = (
+                    expert_load_pass.reshape(
+                        expert_load_pass.shape[0], ep_group.size(), -1
+                    )
+                    .sum(dim=-1)
+                    .float()
+                )
+                avg_tokens_tensor = num_tokens_per_rank.mean(dim=0).sum(dim=0)
+                max_tokens_tensor = num_tokens_per_rank.max(dim=0).values.sum(dim=0)
+                avg_tokens, max_tokens = torch.stack(
+                    [avg_tokens_tensor, max_tokens_tensor]
+                ).tolist()
+                balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
+                if ep_group.rank() == 0:
+                    logger.info(
+                        "EPLB step: %d for model %s: avg_tokens=%.2f, "
+                        "max_tokens=%d, balancedness=%.4f, "
+                        "steps until the next rearrangement: %d",
+                        self.expert_rearrangement_step,
+                        eplb_model_state.model_name,
+                        avg_tokens,
+                        max_tokens,
+                        balancedness,
+                        self.expert_rearrangement_step_interval
+                        - self.expert_rearrangement_step,
+                    )
+
+        if is_dummy:
+            for model_state in self.model_states.values():
+                if model_state.expert_load_fgate is not None:
+                    model_state.expert_load_fgate.zero_()
+                model_state.expert_load_pass.zero_()
+            self.expert_rearrangement_step += 1
+            if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+                self.expert_rearrangement_step = 0
+                self.rearrange()
+            return
+
+        predicted_loads: list[torch.Tensor] = []
+        model_states = list(self.model_states.values())
+        for model_state in model_states:
+            assert model_state.expert_load_logical_ema is not None
+            logical_load = self._logical_expert_load_from_physical(
+                physical_load=model_state.expert_load_pass,
+                physical_to_logical_map=model_state.physical_to_logical_map,
+                num_logical_experts=model_state.model.num_logical_experts,
+            )
+            alpha = model_state.eplb_ema_alpha
+            model_state.expert_load_logical_ema.mul_(1.0 - alpha).add_(
+                logical_load, alpha=alpha
+            )
+            assert model_state.expert_load_fgate is not None
+            predicted_loads.append(model_state.expert_load_fgate.clone())
+            model_state.expert_load_fgate.zero_()
+            model_state.expert_load_pass.zero_()
+
+        global_predicted_loads = self._allreduce_list(predicted_loads)
+        fast_refresh_plan: list[
+            tuple[
+                EplbModelState,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = []
+
+        for model_state, global_predicted_load in zip(
+            model_states, global_predicted_loads
+        ):
+            (
+                new_physical_to_logical_map,
+                new_logical_to_physical_map,
+                new_logical_replica_count,
+                new_active_dynamic_bank_idx,
+                layer_swap_mask,
+                layer_changed_slots,
+            ) = self._build_hybrid_peer_cache_fast_refresh(
+                model_state=model_state,
+                global_predicted_load=global_predicted_load,
+            )
+            if not torch.any(layer_swap_mask):
+                continue
+            fast_refresh_plan.append(
+                (
+                    model_state,
+                    new_physical_to_logical_map,
+                    new_logical_to_physical_map,
+                    new_logical_replica_count,
+                    new_active_dynamic_bank_idx,
+                    layer_changed_slots,
+                )
+            )
+
+        if fast_refresh_plan and ep_group.rank() == 0:
+            total_changed_slots = sum(int(item[5].sum().item()) for item in fast_refresh_plan)
+            total_swapped_layers = sum(
+                int(
+                    torch.count_nonzero(
+                        item[4] != item[0].peer_cache_active_dynamic_bank_idx
+                    ).item()
+                )
+                for item in fast_refresh_plan
+                if item[0].peer_cache_active_dynamic_bank_idx is not None
+            )
+            logger.info(
+                "fgate-hybrid-cache immediate refresh: swapped_layers=%d, "
+                "changed_standby_slots=%d",
+                total_swapped_layers,
+                total_changed_slots,
+            )
+
+        for (
+            model_state,
+            new_physical_to_logical_map,
+            new_logical_to_physical_map,
+            new_logical_replica_count,
+            new_active_dynamic_bank_idx,
+            layer_changed_slots,
+        ) in fast_refresh_plan:
+            changed_layers = torch.nonzero(layer_changed_slots > 0, as_tuple=False).flatten()
+            if changed_layers.numel() > 0:
+                rearrange_expert_weights_inplace(
+                    model_state.physical_to_logical_map[changed_layers],
+                    new_physical_to_logical_map[changed_layers],
+                    [
+                        model_state.model.expert_weights[int(layer)]
+                        for layer in changed_layers
+                    ],
+                    ep_group,
+                    is_profile=False,
+                )
+            swap_layers = torch.nonzero(
+                new_active_dynamic_bank_idx != model_state.peer_cache_active_dynamic_bank_idx,
+                as_tuple=False,
+            ).flatten()
+            if swap_layers.numel() == 0:
+                continue
+            model_state.physical_to_logical_map[swap_layers].copy_(
+                new_physical_to_logical_map[swap_layers]
+            )
+            model_state.peer_cache_active_dynamic_bank_idx[swap_layers].copy_(
+                new_active_dynamic_bank_idx[swap_layers]
+            )
+            model_state.logical_to_physical_map[swap_layers].copy_(
+                new_logical_to_physical_map[swap_layers]
+            )
+            model_state.logical_replica_count[swap_layers].copy_(
+                new_logical_replica_count[swap_layers]
+            )
+
+        self.expert_rearrangement_step += 1
+        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+            self.expert_rearrangement_step = 0
+            self.rearrange()
+
     def add_model(
         self,
         model: MixtureOfExperts,
@@ -750,7 +1303,9 @@ class EplbState:
                 model.num_routed_experts,
                 model.num_redundant_experts,
                 ep_size=ep_size,
-                balance_redundant=(eplb_algorithm == "fgate-peer-cache"),
+                balance_redundant=(
+                    eplb_algorithm in ("fgate-peer-cache", "fgate-hybrid-cache")
+                ),
             )
         )
         physical_to_logical_map = torch.tensor(
@@ -826,14 +1381,28 @@ class EplbState:
                 device=self.device,
             )
 
+        expert_load_logical_ema: torch.Tensor | None = None
+        if eplb_algorithm == "fgate-hybrid-cache":
+            expert_load_logical_ema = torch.zeros(
+                (model.num_moe_layers, model.num_logical_experts),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
         expert_load_fgate: torch.Tensor | None = None
         expert_load_fgate_window: torch.Tensor | None = None
-        if eplb_algorithm in ("fgate", "fgate-v2", "fgate-peer-cache"):
+        if eplb_algorithm in (
+            "fgate",
+            "fgate-v2",
+            "fgate-peer-cache",
+            "fgate-hybrid-cache",
+        ):
             expert_load_fgate = torch.zeros(
                 (model.num_moe_layers, model.num_logical_experts),
                 dtype=torch.float32,
                 device=self.device,
             )
+        if eplb_algorithm in ("fgate", "fgate-v2", "fgate-peer-cache"):
             expert_load_fgate_window = torch.zeros(
                 (
                     self.expert_load_window_size,
@@ -866,18 +1435,14 @@ class EplbState:
                 eplb_ema_alpha,
             )
 
-        model.set_eplb_state(
-            expert_load_pass,
-            logical_to_physical_map,
-            logical_replica_count,
-            expert_load_fgate=expert_load_fgate,
-            fgate_skip_prefill=(eplb_algorithm in ("fgate-v2", "fgate-peer-cache")),
-        )
-
         expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
         peer_cache_dynamic_physical_ids = None
         peer_cache_static_physical_to_logical_map = None
         peer_cache_home_rank = None
+        peer_cache_primary_physical_to_logical_map = None
+        peer_cache_static_physical_ids = None
+        peer_cache_dynamic_bank_physical_ids = None
+        peer_cache_active_dynamic_bank_idx = None
         if eplb_algorithm == "fgate-peer-cache":
             if ep_group.rank() == 0 and self.parallel_config.data_parallel_size > 1:
                 logger.warning(
@@ -900,6 +1465,98 @@ class EplbState:
             peer_cache_home_rank = (
                 primary_logical_to_physical[0] // num_local_physical_experts
             ).to(self.device)
+        elif eplb_algorithm == "fgate-hybrid-cache":
+            if ep_group.rank() == 0 and self.parallel_config.data_parallel_size > 1:
+                logger.warning(
+                    "fgate-hybrid-cache immediate per-step refresh is disabled when "
+                    "data_parallel_size=%d because request-local decode steps are "
+                    "not synchronized across EP ranks; falling back to periodic "
+                    "hybrid peer-cache refresh controlled by step_interval.",
+                    self.parallel_config.data_parallel_size,
+                )
+            static_redundant = (
+                self.parallel_config.eplb_config.resolved_static_redundant_experts()
+            )
+            (
+                peer_cache_static_physical_ids,
+                peer_cache_dynamic_bank_physical_ids,
+            ) = EplbState.get_hybrid_peer_cache_physical_ids(
+                model.num_logical_experts,
+                model.num_physical_experts,
+                ep_size,
+                static_redundant,
+            )
+            peer_cache_primary_physical_to_logical_map = physical_to_logical_map.clone()
+            peer_cache_dynamic_physical_ids = (
+                peer_cache_dynamic_bank_physical_ids.reshape(-1).to(self.device)
+            )
+            peer_cache_static_physical_ids = peer_cache_static_physical_ids.to(
+                self.device
+            )
+            peer_cache_dynamic_bank_physical_ids = (
+                peer_cache_dynamic_bank_physical_ids.to(self.device)
+            )
+            peer_cache_active_dynamic_bank_idx = torch.zeros(
+                (model.num_moe_layers,),
+                dtype=torch.long,
+                device=self.device,
+            )
+            primary_logical_to_physical = logical_to_physical_map[:, :, 0]
+            num_local_physical_experts = model.num_local_physical_experts
+            peer_cache_home_rank = (
+                primary_logical_to_physical[0] // num_local_physical_experts
+            ).to(self.device)
+
+            hybrid_base_mask = torch.ones(
+                (model.num_physical_experts,),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            hybrid_base_mask[peer_cache_dynamic_physical_ids.long()] = False
+            hybrid_base_mask[peer_cache_static_physical_ids.long()] = True
+            hybrid_base_physical_ids = torch.nonzero(
+                hybrid_base_mask, as_tuple=False
+            ).flatten()
+            hybrid_logical_to_physical_map = torch.full_like(
+                logical_to_physical_map, -1
+            )
+            hybrid_logical_replica_count = torch.zeros_like(logical_replica_count)
+            for layer_idx in range(model.num_moe_layers):
+                included_ids = hybrid_base_physical_ids
+                active_ids = peer_cache_dynamic_bank_physical_ids[0].long()
+                if active_ids.numel() > 0:
+                    included_ids = torch.cat((included_ids, active_ids))
+                (
+                    layer_logical_to_physical,
+                    layer_logical_replica_count,
+                ) = EplbState.build_logical_mapping_from_physical_subset(
+                    physical_to_logical_map=physical_to_logical_map[layer_idx].long(),
+                    included_physical_ids=included_ids,
+                    num_logical_experts=model.num_logical_experts,
+                    max_slots_per_logical_expert=max_slots_per_logical_expert,
+                )
+                hybrid_logical_to_physical_map[layer_idx].copy_(
+                    layer_logical_to_physical
+                )
+                hybrid_logical_replica_count[layer_idx].copy_(
+                    layer_logical_replica_count
+                )
+            logical_to_physical_map = hybrid_logical_to_physical_map
+            logical_replica_count = hybrid_logical_replica_count
+
+        model.set_eplb_state(
+            expert_load_pass,
+            logical_to_physical_map,
+            logical_replica_count,
+            expert_load_fgate=expert_load_fgate,
+            fgate_skip_prefill=(
+                eplb_algorithm in (
+                    "fgate-v2",
+                    "fgate-peer-cache",
+                    "fgate-hybrid-cache",
+                )
+            ),
+        )
 
         model_state = EplbModelState(
             physical_to_logical_map=physical_to_logical_map,
@@ -910,6 +1567,7 @@ class EplbState:
             eplb_algorithm=eplb_algorithm,
             eplb_ema_alpha=eplb_ema_alpha,
             expert_load_ema=expert_load_ema,
+            expert_load_logical_ema=expert_load_logical_ema,
             expert_load_fgate=expert_load_fgate,
             expert_load_fgate_window=expert_load_fgate_window,
             expert_load_fgate_window_step=0,
@@ -940,6 +1598,10 @@ class EplbState:
             peer_cache_static_physical_to_logical_map=peer_cache_static_physical_to_logical_map,
             peer_cache_dynamic_physical_ids=peer_cache_dynamic_physical_ids,
             peer_cache_home_rank=peer_cache_home_rank,
+            peer_cache_primary_physical_to_logical_map=peer_cache_primary_physical_to_logical_map,
+            peer_cache_static_physical_ids=peer_cache_static_physical_ids,
+            peer_cache_dynamic_bank_physical_ids=peer_cache_dynamic_bank_physical_ids,
+            peer_cache_active_dynamic_bank_idx=peer_cache_active_dynamic_bank_idx,
         )
         self.model_states[model_config.compute_hash()] = model_state
         self.num_valid_physical_experts = model.num_physical_experts
@@ -1028,6 +1690,21 @@ class EplbState:
                         - self.expert_rearrangement_step,
                     )
 
+        if (
+            self.parallel_config.data_parallel_size == 1
+            and self.model_states
+            and all(
+                eplb_model_state.eplb_algorithm == "fgate-hybrid-cache"
+                for eplb_model_state in self.model_states.values()
+            )
+        ):
+            self._step_hybrid_peer_cache(
+                is_dummy=is_dummy,
+                is_profile=is_profile,
+                log_stats=False,
+            )
+            return
+
         if any(
             eplb_model_state.eplb_algorithm == "fgate-peer-cache"
             for eplb_model_state in self.model_states.values()
@@ -1065,6 +1742,19 @@ class EplbState:
                         >= self.expert_load_window_size
                     ):
                         eplb_model_state.expert_load_fgate_window_step = 0
+                    eplb_model_state.expert_load_fgate.zero_()
+                elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
+                    assert eplb_model_state.expert_load_logical_ema is not None
+                    assert eplb_model_state.expert_load_fgate is not None
+                    logical_load = self._logical_expert_load_from_physical(
+                        physical_load=eplb_model_state.expert_load_pass,
+                        physical_to_logical_map=eplb_model_state.physical_to_logical_map,
+                        num_logical_experts=eplb_model_state.model.num_logical_experts,
+                    )
+                    alpha = eplb_model_state.eplb_ema_alpha
+                    eplb_model_state.expert_load_logical_ema.mul_(1.0 - alpha).add_(
+                        logical_load, alpha=alpha
+                    )
                     eplb_model_state.expert_load_fgate.zero_()
                 else:
                     eplb_model_state.expert_load_window[self.expert_load_window_step] = (
@@ -1167,6 +1857,9 @@ class EplbState:
                 global_expert_load_window = (
                     eplb_model_state.expert_load_fgate_window.sum(dim=0).float()
                 )
+            elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
+                assert eplb_model_state.expert_load_logical_ema is not None
+                global_expert_load_window = eplb_model_state.expert_load_logical_ema
             else:
                 expert_load_window = eplb_model_state.expert_load_window[
                     :, :, : self.num_valid_physical_experts
@@ -1217,11 +1910,12 @@ class EplbState:
             num_gpus = ep_group.size()
 
         if any(
-            eplb_model_state.eplb_algorithm == "fgate-peer-cache"
+            eplb_model_state.eplb_algorithm
+            in ("fgate-peer-cache", "fgate-hybrid-cache")
             for eplb_model_state in self.model_states.values()
         ) and num_nodes != 1:
             raise RuntimeError(
-                "fgate-peer-cache currently only supports same-node EPLB "
+                "fgate peer-cache algorithms currently only support same-node EPLB "
                 f"(got num_nodes={num_nodes})."
             )
 
@@ -1265,6 +1959,32 @@ class EplbState:
                             eplb_model_state.model_name,
                             changed_slots,
                             int(dynamic_ids.numel() * eplb_model_state.model.num_moe_layers),
+                        )
+                elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
+                    (
+                        new_physical_to_logical_map,
+                        new_logical_to_physical_map,
+                        new_logical_replica_count,
+                    ) = self._build_hybrid_peer_cache_static_mapping(
+                        model_state=eplb_model_state,
+                        global_logical_ema_load=global_expert_load_window,
+                    )
+                    if (
+                        is_main_rank
+                        and not is_profile
+                        and eplb_model_state.peer_cache_static_physical_ids is not None
+                    ):
+                        static_ids = eplb_model_state.peer_cache_static_physical_ids.long()
+                        changed_slots = (
+                            eplb_model_state.physical_to_logical_map[:, static_ids]
+                            != new_physical_to_logical_map[:, static_ids]
+                        ).sum().item()
+                        logger.info(
+                            "fgate-hybrid-cache static refresh for model %s: "
+                            "changed_static_slots=%d/%d",
+                            eplb_model_state.model_name,
+                            changed_slots,
+                            int(static_ids.numel() * eplb_model_state.model.num_moe_layers),
                         )
                 else:
                     (
@@ -1585,6 +2305,20 @@ class EplbState:
         num_physical_experts = expanded_physical_to_logical.shape[1]
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
         eplb_model_state.physical_to_logical_map.copy_(expanded_physical_to_logical)
+
+        if eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
+            assert eplb_model_state.peer_cache_active_dynamic_bank_idx is not None
+            (
+                logical_to_physical_map,
+                logical_replica_count,
+            ) = eplb_state._build_hybrid_peer_cache_runtime_logical_mapping(
+                model_state=eplb_model_state,
+                physical_to_logical_map=eplb_model_state.physical_to_logical_map,
+                active_dynamic_bank_idx=eplb_model_state.peer_cache_active_dynamic_bank_idx,
+            )
+            eplb_model_state.logical_to_physical_map.copy_(logical_to_physical_map)
+            eplb_model_state.logical_replica_count.copy_(logical_replica_count)
+            return eplb_state
 
         logical_to_physical_map = torch.full(
             (
