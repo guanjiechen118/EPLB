@@ -904,12 +904,15 @@ class Worker(WorkerBase):
 
     def execute_dummy_batch(self) -> None:
         # This dummy batch is only used to keep DP ranks aligned on
-        # collectives (e.g. around EPLB rearrangement). Force eager mode
-        # so it does not enter the fragile full-cudagraph MLA metadata path.
+        # collectives. Force eager mode so it does not enter the fragile
+        # full-cudagraph MLA metadata path. EPLB still runs at the end of the
+        # dummy step so it can consume the periodic rearrange bit piggybacked
+        # on the DP coordination collective.
         self.model_runner._dummy_run(
             1,
             uniform_decode=True,
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            skip_eplb=False,
         )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:

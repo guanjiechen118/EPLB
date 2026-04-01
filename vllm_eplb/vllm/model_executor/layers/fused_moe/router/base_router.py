@@ -14,9 +14,8 @@ from vllm.platforms import current_platform
 if current_platform.is_cuda_alike():
 
     @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
-    def eplb_map_to_physical_and_record(
+    def eplb_map_to_physical(
         topk_ids: torch.Tensor,
-        expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> torch.Tensor:
@@ -60,7 +59,14 @@ if current_platform.is_cuda_alike():
 
         topk_ids = physical_ids
 
-        # 2. Record expert load metrics.
+        return topk_ids
+
+    @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+    def eplb_record_physical_expert_load(
+        topk_ids: torch.Tensor,
+        expert_load_view: torch.Tensor,
+    ) -> torch.Tensor:
+        # Record expert load metrics after any local expert-id rewrites.
 
         # TODO(bowen): When using `FusedMoEModularKernel`, this
         # can be done in a more unified way, since
@@ -84,15 +90,63 @@ if current_platform.is_cuda_alike():
             src=torch.ones_like(topk_ids_flatten).to(expert_load_view),
         )
         return topk_ids
+
+    @torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+    def eplb_apply_local_dynamic_shadow_mapping(
+        topk_ids: torch.Tensor,
+        active_shadow_ids: torch.Tensor,
+        active_shadow_logicals: torch.Tensor,
+        physical_to_logical_map: torch.Tensor,
+        local_token_mask: torch.Tensor,
+        local_shadow_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        current_logical_ids = physical_to_logical_map[topk_ids.long()]
+        shadow_match = (
+            local_token_mask.unsqueeze(-1)
+            & local_shadow_mask.view(1, 1, -1)
+            & (current_logical_ids.unsqueeze(-1) == active_shadow_logicals.view(1, 1, -1))
+        )
+        shadow_count = shadow_match.sum(dim=-1)
+        pos_indices = torch.arange(
+            topk_ids.numel(), device=topk_ids.device, dtype=torch.long
+        ).reshape_as(topk_ids)
+        route_mod = torch.remainder(pos_indices, shadow_count.long() + 1)
+        use_shadow = shadow_count > 0
+        use_shadow &= local_token_mask
+        use_shadow &= route_mod > 0
+
+        match_rank = torch.cumsum(shadow_match.to(torch.int32), dim=-1) - 1
+        selector = (route_mod - 1).clamp_min(0).unsqueeze(-1)
+        selected_shadow_ids = torch.where(
+            shadow_match & (match_rank == selector),
+            active_shadow_ids.view(1, 1, -1),
+            -1,
+        ).amax(dim=-1)
+        return torch.where(use_shadow, selected_shadow_ids, topk_ids.long())
 else:
 
-    def eplb_map_to_physical_and_record(
+    def eplb_map_to_physical(
         topk_ids: torch.Tensor,
-        expert_load_view: torch.Tensor,
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
     ) -> torch.Tensor:
         # CPU fallback: no EPLB so just return as is
+        return topk_ids
+
+    def eplb_record_physical_expert_load(
+        topk_ids: torch.Tensor,
+        expert_load_view: torch.Tensor,
+    ) -> torch.Tensor:
+        return topk_ids
+
+    def eplb_apply_local_dynamic_shadow_mapping(
+        topk_ids: torch.Tensor,
+        active_shadow_ids: torch.Tensor,
+        active_shadow_logicals: torch.Tensor,
+        physical_to_logical_map: torch.Tensor,
+        local_token_mask: torch.Tensor,
+        local_shadow_mask: torch.Tensor,
+    ) -> torch.Tensor:
         return topk_ids
 
 
@@ -159,13 +213,57 @@ class BaseRouter(FusedMoERouter):
             assert self.eplb_state.expert_load_view is not None
             assert self.eplb_state.logical_to_physical_map is not None
             assert self.eplb_state.logical_replica_count is not None
-            return eplb_map_to_physical_and_record(
+            topk_ids = eplb_map_to_physical(
                 topk_ids=topk_ids,
-                expert_load_view=self.eplb_state.expert_load_view,
                 logical_to_physical_map=self.eplb_state.logical_to_physical_map,
                 logical_replica_count=self.eplb_state.logical_replica_count,
             )
+            topk_ids = self._apply_local_dynamic_shadow_mapping(topk_ids)
+            return eplb_record_physical_expert_load(
+                topk_ids=topk_ids,
+                expert_load_view=self.eplb_state.expert_load_view,
+            )
         return topk_ids
+
+    def _apply_local_dynamic_shadow_mapping(
+        self, topk_ids: torch.Tensor
+    ) -> torch.Tensor:
+        active_shadow_ids = (
+            self.eplb_state.local_dynamic_shadow_active_physical_ids
+        )
+        active_shadow_logicals = (
+            self.eplb_state.local_dynamic_shadow_active_logical_ids
+        )
+        physical_to_logical_map = self.eplb_state.physical_to_logical_map
+        if (
+            active_shadow_ids is None
+            or active_shadow_logicals is None
+            or physical_to_logical_map is None
+            or active_shadow_ids.numel() == 0
+        ):
+            return topk_ids
+
+        if active_shadow_ids.numel() == 0:
+            return topk_ids
+
+        expert_map = self.eplb_state.expert_map
+        if expert_map is None:
+            local_token_mask = torch.ones_like(topk_ids, dtype=torch.bool)
+            local_shadow_mask = torch.ones_like(
+                active_shadow_ids, dtype=torch.bool, device=active_shadow_ids.device
+            )
+        else:
+            local_token_mask = expert_map[topk_ids.long()] >= 0
+            local_shadow_mask = expert_map[active_shadow_ids] >= 0
+
+        return eplb_apply_local_dynamic_shadow_mapping(
+            topk_ids=topk_ids,
+            active_shadow_ids=active_shadow_ids,
+            active_shadow_logicals=active_shadow_logicals,
+            physical_to_logical_map=physical_to_logical_map,
+            local_token_mask=local_token_mask,
+            local_shadow_mask=local_shadow_mask,
+        )
 
     def _convert_indices_dtype(
         self, topk_ids: torch.Tensor, indices_type: torch.dtype | None

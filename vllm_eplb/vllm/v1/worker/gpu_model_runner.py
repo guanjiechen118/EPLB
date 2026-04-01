@@ -412,20 +412,33 @@ class GPUModelRunner(
             and parallel_config.eplb_config.algorithm
             in ("fgate-peer-cache", "fgate-hybrid-cache")
         ):
-            if self.compilation_config.mode != CompilationMode.NONE:
+            if parallel_config.eplb_config.algorithm == "fgate-hybrid-cache":
+                if self.compilation_config.cudagraph_mode not in (
+                    CUDAGraphMode.NONE,
+                    CUDAGraphMode.PIECEWISE,
+                ):
+                    logger.warning(
+                        "fgate-hybrid-cache is overriding cudagraph_mode from %s "
+                        "to PIECEWISE so layer-local shadow refresh can execute "
+                        "between MoE layers on the Python path.",
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                    self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+            elif self.compilation_config.cudagraph_mode not in (
+                CUDAGraphMode.NONE,
+                CUDAGraphMode.PIECEWISE,
+                CUDAGraphMode.FULL_DECODE_ONLY,
+            ):
                 logger.warning(
-                    "%s is forcing CompilationMode.NONE for stability.",
+                    "%s is overriding cudagraph_mode from %s to "
+                    "FULL_DECODE_ONLY so decode can stay graphed while "
+                    "peer-cache refresh remains outside capture.",
                     parallel_config.eplb_config.algorithm,
+                    self.compilation_config.cudagraph_mode.name,
                 )
-                self.compilation_config.mode = CompilationMode.NONE
-                self.compilation_config.compile_sizes = []
-            if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-                logger.warning(
-                    "%s is forcing cudagraph_mode=NONE for stability.",
-                    parallel_config.eplb_config.algorithm,
+                self.compilation_config.cudagraph_mode = (
+                    CUDAGraphMode.FULL_DECODE_ONLY
                 )
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                self.compilation_config.cudagraph_capture_sizes = []
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
@@ -3563,6 +3576,8 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_for_forward()
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -5015,6 +5030,8 @@ class GPUModelRunner(
             # The current dummy run only covers LM execution, so we can skip it.
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
+        if self.eplb_state is not None:
+            self.eplb_state.prepare_for_forward()
 
         assert (
             cudagraph_runtime_mode is None

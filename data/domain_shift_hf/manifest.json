@@ -1,0 +1,118 @@
+{
+  "domains": {
+    "math": {
+      "hf_path": "openai/gsm8k",
+      "config": "main",
+      "split": "train",
+      "file_format": null,
+      "data_files": [],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "grade-school math reasoning"
+    },
+    "general_qa": {
+      "hf_path": "rajpurkar/squad_v2",
+      "config": null,
+      "split": "train",
+      "file_format": null,
+      "data_files": [],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "general-domain question answering"
+    },
+    "summarization": {
+      "hf_path": "knkarthick/dialogsum",
+      "config": null,
+      "split": "train",
+      "file_format": "csv",
+      "data_files": [
+        "train.csv"
+      ],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "dialog summarization"
+    },
+    "translation": {
+      "hf_path": "Helsinki-NLP/opus_books",
+      "config": null,
+      "split": "train",
+      "file_format": "parquet",
+      "data_files": [
+        "en-fr/train-00000-of-00001.parquet"
+      ],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "English-to-French translation"
+    },
+    "finance": {
+      "hf_path": "SheikhIrtiza/finance_QA_dataset",
+      "config": null,
+      "split": "train",
+      "file_format": "csv",
+      "data_files": [
+        "Financial-QA-10k.csv"
+      ],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "finance-domain question answering"
+    },
+    "medical": {
+      "hf_path": "FreedomIntelligence/medical-o1-reasoning-SFT",
+      "config": null,
+      "split": "train",
+      "file_format": "json",
+      "data_files": [
+        "medical_o1_sft.json"
+      ],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "medical reasoning"
+    },
+    "legal": {
+      "hf_path": "isaacus/legal-rag-qa",
+      "config": null,
+      "split": "train",
+      "file_format": "json",
+      "data_files": [
+        "qa.jsonl"
+      ],
+      "rows": 512,
+      "unique_rows": 138,
+      "resampled_rows": 374,
+      "note": "legal question answering"
+    },
+    "code": {
+      "hf_path": "greengerong/leetcode",
+      "config": null,
+      "split": "train",
+      "file_format": "json",
+      "data_files": [
+        "leetcode-train.jsonl"
+      ],
+      "rows": 512,
+      "unique_rows": 512,
+      "resampled_rows": 0,
+      "note": "coding/problem-solving"
+    }
+  },
+  "scenarios": {
+    "stable": {
+      "rows": 1024
+    },
+    "block_64": {
+      "rows": 512
+    },
+    "alternating_2": {
+      "rows": 512
+    },
+    "random_uniform": {
+      "rows": 256
+    }
+  }
+}

@@ -386,6 +386,75 @@ def move_to_buffer(
     )
 
 
+def move_to_buffer_local_only(
+    num_local_experts: int,
+    old_indices: np.ndarray,
+    new_indices: np.ndarray,
+    expert_weights: Sequence[torch.Tensor],
+    expert_weights_buffers: Sequence[torch.Tensor],
+) -> MoveToBufferResult:
+    """
+    Rearranges expert weights using only local copies.
+
+    This path is intended for decode-time hybrid shadow refresh where the new
+    logical experts are guaranteed to already have a local physical copy on the
+    same EP rank. It performs no distributed communication and raises if that
+    invariant is violated.
+    """
+    assert old_indices.shape == new_indices.shape
+
+    ep_rank = get_ep_group().device_group.rank()
+    recv_primary_mask = np.zeros((num_local_experts,), dtype=np.bool_)
+    recv_expert_ids = np.full((num_local_experts,), -1, dtype=np.int64)
+    recv_dst_rows = np.full((num_local_experts,), -1, dtype=np.int32)
+
+    base = ep_rank * num_local_experts
+    local_rows = np.arange(num_local_experts, dtype=np.int32)
+    local_global = base + local_rows
+
+    old_local_expert_ids = old_indices[local_global]
+    new_local_expert_ids = new_indices[local_global]
+
+    is_unchanged = old_local_expert_ids == new_local_expert_ids
+    new_valid = new_local_expert_ids != -1
+    can_recv_local = np.isin(
+        new_local_expert_ids, old_local_expert_ids, assume_unique=False
+    )
+    missing_local_mask = np.logical_and(new_valid, ~can_recv_local)
+    if bool(missing_local_mask.any()):
+        missing_experts = np.unique(new_local_expert_ids[missing_local_mask]).tolist()
+        raise RuntimeError(
+            "local-only hybrid refresh requested experts without a local source: "
+            f"{missing_experts}"
+        )
+
+    is_received_locally = np.logical_or(is_unchanged, can_recv_local)
+    if bool(np.logical_and(~is_unchanged, new_valid).any()):
+        valid_old = old_local_expert_ids != -1
+        uniq_experts, first_idx = np.unique(
+            old_local_expert_ids[valid_old], return_index=True
+        )
+        src_rows = local_rows[valid_old][first_idx]
+        expert_to_src_map = dict(zip(uniq_experts.tolist(), src_rows.tolist()))
+        dest_indices = np.nonzero(np.logical_and(~is_unchanged, new_valid))[0].tolist()
+        for dst in dest_indices:
+            expert = int(new_local_expert_ids[dst])
+            src = expert_to_src_map[expert]
+            for w, b in zip(expert_weights, expert_weights_buffers):
+                b[dst].copy_(w[src], non_blocking=True)
+
+    return (
+        is_unchanged,
+        is_received_locally,
+        RecvMetadata(
+            recv_primary_mask=recv_primary_mask,
+            recv_count=0,
+            recv_expert_ids=recv_expert_ids,
+            recv_dst_rows=recv_dst_rows,
+        ),
+    )
+
+
 def move_from_buffer(
     expert_weights: Sequence[torch.Tensor],
     expert_weights_buffers: list[torch.Tensor],
@@ -588,6 +657,16 @@ def rearrange_expert_weights_inplace(
                 rank_mapping,
                 ep_group.size(),
             )
+
+    if (
+        not is_profile
+        and torch.cuda.is_available()
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "EPLB expert rearrangement attempted during CUDA graph capture. "
+            "Peer-cache refresh must stay outside captured execution."
+        )
 
     assert old_global_expert_indices.shape[1] == new_global_expert_indices.shape[1]
 

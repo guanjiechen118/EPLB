@@ -134,6 +134,24 @@ class EPLBConfig:
     policy: EPLBPolicyOption = "default"
     """The policy type for expert parallel load balancing (EPLB)."""
 
+    hybrid_periodic_rearrange_with_multi_dp: bool = True
+    """
+    When ``algorithm="fgate-hybrid-cache"`` and ``data_parallel_size > 1``,
+    the default behavior skips periodic ``rearrange()`` to avoid long stalls
+    and desynchronized DP workers. When enabled, the periodic static refresh is
+    allowed on the normal real-step path; the dummy-step path still skips it to
+    avoid the previously observed multi-DP deadlock.
+    """
+
+    fgate_decode_stride: int = Field(default=4, ge=1)
+    """
+    For fgate-style EPLB algorithms, run the forward-gate predictor only on a
+    subsample of decode steps (batches with ``max_query_len==1``). ``1`` means
+    every decode step (highest accuracy, highest overhead). Values ``>1`` reduce
+    per-token MoE overhead (TPOT/ITL); on sampled steps the accumulated load is
+    scaled by this stride to approximate the skipped updates.
+    """
+
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
         if self.use_async and self.policy != "default":

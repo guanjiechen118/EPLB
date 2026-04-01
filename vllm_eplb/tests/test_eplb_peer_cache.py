@@ -100,7 +100,7 @@ def test_hybrid_peer_cache_runtime_mapping_ignores_inactive_bank():
     assert 4 not in logical_to_physical_map[0].tolist()[3]
     assert 9 not in logical_to_physical_map[0].tolist()[2]
     assert set(logical_to_physical_map[0, 0, :2].tolist()) == {0, 2}
-    assert logical_replica_count.tolist() == [[3, 2, 2, 1]]
+    assert logical_replica_count.tolist() == [[2, 2, 1, 1]]
 
 
 def test_hybrid_peer_cache_static_slots_default_to_half():

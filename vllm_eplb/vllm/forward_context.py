@@ -19,6 +19,11 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices
 
 logger = init_logger(__name__)
 
+_EPLB_FGATE_DECODE_STRIDE_TICK: int = 0
+_EPLB_FGATE_ALGORITHMS: frozenset[str] = frozenset(
+    ("fgate", "fgate-v2", "fgate-peer-cache", "fgate-hybrid-cache")
+)
+
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
 last_logging_time: float = 0
 forward_start_time: float = 0
@@ -262,9 +267,68 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def peek_max_query_len_from_attn_metadata(
+    attn_metadata: Any,
+    default: int = 1,
+) -> int:
+    """Infer max_query_len before ForwardContext is created (set_forward_context)."""
+    if attn_metadata is None:
+        return default
+    metadata_values: list[Any] = []
+    if isinstance(attn_metadata, list):
+        for metadata_dict in attn_metadata:
+            metadata_values.extend(metadata_dict.values())
+    else:
+        metadata_values.extend(attn_metadata.values())
+
+    for metadata in metadata_values:
+        max_query_len = getattr(metadata, "max_query_len", None)
+        if max_query_len is not None:
+            return int(max_query_len)
+    return default
+
+
+def eplb_fgate_decode_stride_skip_and_scale() -> tuple[bool, float]:
+    """
+    Returns (skip_fgate_accumulate, pred_load_scale).
+
+    When skip is True, the caller should not run the forward-gate EPLB path.
+    When skip is False and scale > 1, multiply pred_load by scale to approximate
+    skipped decode steps.
+
+    Uses only ForwardContext (not get_current_vllm_config): during normal
+    inference and torch.compile tracing, the global vllm config is unset outside
+    of model loading, while set_forward_context always runs for forwards.
+    """
+    if not is_forward_context_available():
+        return False, 1.0
+    ctx = get_forward_context()
+    tick = int(ctx.additional_kwargs.get("eplb_fgate_decode_stride_tick", 0))
+    if tick <= 0:
+        return False, 1.0
+    stride = int(ctx.additional_kwargs.get("eplb_fgate_decode_stride_value", 1))
+    if stride <= 1:
+        return False, 1.0
+    mq = ctx.additional_kwargs.get("max_query_len")
+    if mq is None:
+        mq = get_forward_context_max_query_len()
+    mq = int(mq)
+    if mq > 1:
+        return False, 1.0
+    if ((tick - 1) % stride) != 0:
+        return True, 1.0
+    return False, float(stride)
+
+
 def get_forward_context_max_query_len(default: int = 1) -> int:
     """Best-effort access to the current batch max_query_len."""
     ctx = get_forward_context()
+
+    # set_forward_context always materializes this; MoE layers call here once per
+    # layer — scanning full attn_metadata every time dominated TPOT on fgate.
+    mq = ctx.additional_kwargs.get("max_query_len")
+    if mq is not None:
+        return int(mq)
 
     attn_metadata = ctx.attn_metadata
     if attn_metadata is None:
@@ -281,9 +345,6 @@ def get_forward_context_max_query_len(default: int = 1) -> int:
         if max_query_len is not None:
             return int(max_query_len)
 
-    maybe_extra = ctx.additional_kwargs.get("max_query_len")
-    if maybe_extra is not None:
-        return int(maybe_extra)
     return default
 
 
@@ -395,6 +456,34 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+
+    if attn_metadata is not None:
+        mq = additional_kwargs.get("max_query_len")
+        if mq is None:
+            mq = peek_max_query_len_from_attn_metadata(attn_metadata, default=1)
+        additional_kwargs["max_query_len"] = int(mq)
+    elif "max_query_len" not in additional_kwargs:
+        additional_kwargs["max_query_len"] = 1
+
+    global _EPLB_FGATE_DECODE_STRIDE_TICK
+    pc = vllm_config.parallel_config
+    ec = pc.eplb_config
+    mq_int = int(additional_kwargs.get("max_query_len", 1))
+    if (
+        attn_metadata is not None
+        and pc.enable_eplb
+        and ec.fgate_decode_stride > 1
+        and mq_int <= 1
+        and ec.algorithm in _EPLB_FGATE_ALGORITHMS
+    ):
+        _EPLB_FGATE_DECODE_STRIDE_TICK += 1
+        additional_kwargs["eplb_fgate_decode_stride_tick"] = (
+            _EPLB_FGATE_DECODE_STRIDE_TICK
+        )
+        additional_kwargs["eplb_fgate_decode_stride_value"] = ec.fgate_decode_stride
+    else:
+        additional_kwargs["eplb_fgate_decode_stride_tick"] = 0
+        additional_kwargs["eplb_fgate_decode_stride_value"] = 1
 
     forward_context = create_forward_context(
         attn_metadata,

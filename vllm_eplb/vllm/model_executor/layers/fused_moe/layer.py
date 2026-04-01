@@ -475,6 +475,7 @@ class FusedMoE(CustomOp):
                 None,
                 None,
             )
+        self.eplb_state.expert_map = self.expert_map
 
         self.top_k = top_k
 
@@ -839,6 +840,7 @@ class FusedMoE(CustomOp):
             self.register_buffer("_expert_map", expert_map)
             self.register_buffer("expert_mask", expert_mask)
             self._maybe_init_expert_routing_tables()
+            self.eplb_state.expert_map = self.expert_map
             if self.aiter_fmoe_shared_expert_enabled:
                 self._init_aiter_shared_experts_topK_buffer(
                     vllm_config=get_current_vllm_config(),
@@ -1455,6 +1457,7 @@ class FusedMoE(CustomOp):
         logical_replica_count: torch.Tensor,
         next_gate_weight: torch.Tensor | None = None,
         expert_load_fgate_view: torch.Tensor | None = None,
+        expert_load_fgate_target_idx: int | None = None,
         fgate_skip_prefill: bool = False,
     ) -> None:
         """
@@ -1467,9 +1470,17 @@ class FusedMoE(CustomOp):
         self.eplb_state.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.eplb_state.logical_replica_count = logical_replica_count[moe_layer_idx]
         self.eplb_state.next_gate_weight = next_gate_weight
+        fgate_target_idx = (
+            moe_layer_idx
+            if expert_load_fgate_target_idx is None
+            else expert_load_fgate_target_idx
+        )
         self.eplb_state.expert_load_fgate_view = (
-            expert_load_fgate_view[moe_layer_idx]
-            if expert_load_fgate_view is not None
+            expert_load_fgate_view[fgate_target_idx]
+            if (
+                expert_load_fgate_view is not None
+                and fgate_target_idx >= 0
+            )
             else None
         )
         self.next_gate_weight = next_gate_weight

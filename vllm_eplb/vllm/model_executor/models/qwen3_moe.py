@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -41,6 +41,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import (
+    eplb_fgate_decode_stride_skip_and_scale,
     get_forward_context_max_query_len,
     is_forward_context_available,
 )
@@ -162,9 +163,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
-        # Load balancing settings.
-        vllm_config = get_current_vllm_config()
-        eplb_config = vllm_config.parallel_config.eplb_config
+        # Load balancing settings (use ctor arg; global config is unset after load).
+        eplb_config = parallel_config.eplb_config
         self.enable_eplb = parallel_config.enable_eplb
 
         self.n_logical_experts = self.n_routed_experts
@@ -236,25 +236,41 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        consume_pending_layer_refresh = getattr(
+            self.experts.eplb_state, "consume_pending_layer_refresh", None
+        )
+        if consume_pending_layer_refresh is not None:
+            consume_pending_layer_refresh()
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         if (
             getattr(self.experts, "next_gate_weight", None) is not None
-            and getattr(self.experts, "expert_load_fgate_view", None) is not None
         ):
-            skip_fgate = (
+            skip_fgate_prefill_opt = (
                 getattr(self.experts, "fgate_skip_prefill", False)
                 and is_forward_context_available()
                 and get_forward_context_max_query_len() > 1
             )
-            if not skip_fgate:
+            stride_skip, stride_scale = eplb_fgate_decode_stride_skip_and_scale()
+            if not skip_fgate_prefill_opt and not stride_skip:
                 with torch.no_grad():
                     pred_logits = torch.nn.functional.linear(
                         hidden_states, self.experts.next_gate_weight
                     )
                     pred_scores = pred_logits.float().softmax(dim=-1)
                     pred_load = pred_scores.sum(dim=0)
-                    self.experts.expert_load_fgate_view.add_(pred_load)
+                    if stride_scale != 1.0:
+                        pred_load = pred_load * stride_scale
+                    if getattr(self.experts, "expert_load_fgate_view", None) is not None:
+                        self.experts.expert_load_fgate_view.add_(pred_load)
+                    schedule_next_layer_shadow_refresh = getattr(
+                        self.experts.eplb_state,
+                        "schedule_next_layer_shadow_refresh",
+                        None,
+                    )
+                    if schedule_next_layer_shadow_refresh is not None:
+                        schedule_next_layer_shadow_refresh(pred_load)
         shared_out, fused_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -793,9 +809,10 @@ class Qwen3MoeForCausalLM(
         for layer_idx, layer in enumerate(self.moe_layers):
             self.expert_weights.append(layer.get_expert_weights())
 
+            next_layer_idx = layer_idx + 1 if layer_idx + 1 < len(gate_weights) else -1
             next_gate_weight = None
-            if gate_weights:
-                next_gate_weight = gate_weights[min(layer_idx + 1, len(gate_weights) - 1)]
+            if next_layer_idx >= 0:
+                next_gate_weight = gate_weights[next_layer_idx]
 
             layer.set_eplb_state(
                 moe_layer_idx=layer_idx,
@@ -804,6 +821,7 @@ class Qwen3MoeForCausalLM(
                 logical_replica_count=logical_replica_count,
                 next_gate_weight=next_gate_weight,
                 expert_load_fgate_view=expert_load_fgate,
+                expert_load_fgate_target_idx=next_layer_idx,
                 fgate_skip_prefill=fgate_skip_prefill,
             )
 

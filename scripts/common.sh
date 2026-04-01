@@ -8,7 +8,7 @@ export LD_LIBRARY_PATH=/usr/local/nvidia/lib64
 export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH}
 
 resolve_model_profile() {
-  MODEL_KEY=deepseek_v2_lite
+  MODEL_KEY=${MODEL_KEY:-deepseek_v2_lite}
   case "${MODEL_KEY}" in
     deepseek_v2_lite)
       MODEL=/mnt/shared-storage-user/moegroup/share_models/DeepSeek-V2-Lite
@@ -37,7 +37,7 @@ resolve_model_profile() {
   esac
 
   TOKENIZER=${MODEL}
-  MAX_MODEL_LEN=${MAX_MODEL_LEN_DEFAULT}
+  MAX_MODEL_LEN=${MAX_MODEL_LEN:-${MAX_MODEL_LEN_DEFAULT}}
   MODEL_TAG=${MODEL_KEY}
 
   export MODEL_KEY MODEL MODEL_TAG TOKENIZER MAX_MODEL_LEN
