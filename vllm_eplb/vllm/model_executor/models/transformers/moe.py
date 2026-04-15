@@ -128,7 +128,9 @@ class MoEMixin(MixtureOfExperts):
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         expert_load_fgate: torch.Tensor | None = None,
+        enable_next_gate_prediction: bool = False,
         fgate_skip_prefill: bool = False,
+        fgate_prefill_ignore_redundant: bool = False,
     ):
         for moe_layer_idx, mlp_layer in enumerate(self.mlp_moe_layers):
             mlp_layer.experts.set_eplb_state(
@@ -136,8 +138,10 @@ class MoEMixin(MixtureOfExperts):
                 expert_load_view=expert_load_view,
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
+                next_gate_weight=None,
                 expert_load_fgate_view=expert_load_fgate,
                 fgate_skip_prefill=fgate_skip_prefill,
+                fgate_prefill_ignore_redundant=fgate_prefill_ignore_redundant,
             )
 
     def update_physical_experts_metadata(

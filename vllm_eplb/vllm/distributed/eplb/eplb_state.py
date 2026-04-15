@@ -57,14 +57,15 @@ from .rebalance_execute import (
 
 logger = init_logger(__name__)
 
-# Algorithms where each EP rank holds the same replicated global logical
-# estimate (fgate window sums / peer-cache predictions). All-reduce AVG.
-# fgate-hybrid-cache is excluded: per-rank logical EMA may differ; use SUM in
-# rearrange(), and avoid per-step collectives in _step_hybrid_peer_cache (DP /
-# scheduling can desynchronize ranks and deadlock NCCL).
-_EPLB_ALGORITHMS_REPLICATED_LOGICAL_LOAD: frozenset[str] = frozenset(
-    {"fgate", "fgate-v2", "fgate-peer-cache"}
+# Algorithms that use layer-local double-buffered shadow refresh. These do not
+# expose dynamic banks through the global runtime map.
+_EPLB_LOCAL_SHADOW_ALGORITHMS: frozenset[str] = frozenset(
+    {"fgate-only", "fgate-hybrid-cache"}
 )
+
+# No remaining supported algorithm keeps a replicated global logical load
+# tensor that should be averaged across EP ranks during rearrange().
+_EPLB_ALGORITHMS_REPLICATED_LOGICAL_LOAD: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -195,15 +196,13 @@ class EplbModelState:
     expert_load_fgate: torch.Tensor | None
     """
     fgate predicted expert load per step (logical expert space).
-    Only allocated when eplb_algorithm in
-    ("fgate", "fgate-v2", "fgate-peer-cache", "fgate-hybrid-cache").
+    Only allocated when eplb_algorithm="fgate-hybrid-cache".
     Shape: (num_moe_layers, num_logical_experts)
     """
     expert_load_fgate_window: torch.Tensor | None
     """
     Sliding window for fgate predicted load (logical expert space).
-    Only allocated when eplb_algorithm in
-    ("fgate", "fgate-v2", "fgate-peer-cache").
+    Only allocated for legacy periodic fgate algorithms.
     Shape: (window_size, num_moe_layers, num_logical_experts)
     """
     expert_load_fgate_window_step: int
@@ -987,7 +986,7 @@ class EplbState:
         )
 
     def _install_hybrid_layer_runtime_hooks(self, model_state: EplbModelState) -> None:
-        if model_state.eplb_algorithm != "fgate-hybrid-cache":
+        if model_state.eplb_algorithm not in _EPLB_LOCAL_SHADOW_ALGORITHMS:
             return
 
         num_layers = model_state.model.num_moe_layers
@@ -1082,11 +1081,23 @@ class EplbState:
         return model_state.physical_to_logical_map
 
     def _should_barrier_after_hybrid_periodic_rearrange(self) -> bool:
+        ec = self.parallel_config.eplb_config
+        if ec.hybrid_barrier_after_periodic_rearrange is not None:
+            if not ec.hybrid_barrier_after_periodic_rearrange:
+                return False
+            if self.is_async:
+                return False
+            if self.parallel_config.data_parallel_size <= 1:
+                return False
+            return any(
+                model_state.eplb_algorithm == "fgate-hybrid-cache"
+                for model_state in self.model_states.values()
+            )
         if self.is_async:
             return False
         if self.parallel_config.data_parallel_size <= 1:
             return False
-        if not self.parallel_config.eplb_config.hybrid_periodic_rearrange_with_multi_dp:
+        if not ec.hybrid_periodic_rearrange_with_multi_dp:
             return False
         return any(
             model_state.eplb_algorithm == "fgate-hybrid-cache"
@@ -1094,9 +1105,14 @@ class EplbState:
         )
 
     def _hybrid_enable_immediate_layer_refresh(self) -> bool:
+        ec = self.parallel_config.eplb_config
+        if ec.algorithm == "fgate-only":
+            return True
+        if ec.hybrid_immediate_layer_refresh is not None:
+            return ec.hybrid_immediate_layer_refresh
         if self.parallel_config.data_parallel_size <= 1:
             return True
-        if not self.parallel_config.eplb_config.hybrid_periodic_rearrange_with_multi_dp:
+        if not ec.hybrid_periodic_rearrange_with_multi_dp:
             return True
         return False
 
@@ -2097,6 +2113,26 @@ class EplbState:
             self.expert_rearrangement_step = 0
             self.rearrange()
 
+    def _step_fgate_only(
+        self,
+        is_dummy: bool = False,
+        is_profile: bool = False,
+    ) -> None:
+        if is_profile:
+            return
+
+        for model_state in self.model_states.values():
+            if model_state.expert_load_fgate is not None:
+                model_state.expert_load_fgate.zero_()
+            model_state.expert_load_pass.zero_()
+
+        # Keep a bounded step counter for logging cadence, but intentionally
+        # skip periodic rearrange: fgate-only is a pure
+        # layer-local shadow-refresh strategy.
+        self.expert_rearrangement_step += 1
+        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+            self.expert_rearrangement_step = 0
+
     def add_model(
         self,
         model: MixtureOfExperts,
@@ -2116,9 +2152,7 @@ class EplbState:
                 model.num_routed_experts,
                 model.num_redundant_experts,
                 ep_size=ep_size,
-                balance_redundant=(
-                    eplb_algorithm in ("fgate-peer-cache", "fgate-hybrid-cache")
-                ),
+                balance_redundant=(eplb_algorithm in _EPLB_LOCAL_SHADOW_ALGORITHMS),
             )
         )
         physical_to_logical_map = torch.tensor(
@@ -2204,24 +2238,9 @@ class EplbState:
 
         expert_load_fgate: torch.Tensor | None = None
         expert_load_fgate_window: torch.Tensor | None = None
-        if eplb_algorithm in (
-            "fgate",
-            "fgate-v2",
-            "fgate-peer-cache",
-            "fgate-hybrid-cache",
-        ):
+        if eplb_algorithm == "fgate-hybrid-cache":
             expert_load_fgate = torch.zeros(
                 (model.num_moe_layers, model.num_logical_experts),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        if eplb_algorithm in ("fgate", "fgate-v2", "fgate-peer-cache"):
-            expert_load_fgate_window = torch.zeros(
-                (
-                    self.expert_load_window_size,
-                    model.num_moe_layers,
-                    model.num_logical_experts,
-                ),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -2257,31 +2276,9 @@ class EplbState:
         peer_cache_active_dynamic_bank_idx = None
         peer_cache_local_dynamic_bank_physical_ids = None
         peer_cache_local_dynamic_logical_ids = None
-        if eplb_algorithm == "fgate-peer-cache":
+        if eplb_algorithm in _EPLB_LOCAL_SHADOW_ALGORITHMS:
             if ep_group.rank() == 0 and self.parallel_config.data_parallel_size > 1:
-                logger.warning(
-                    "fgate-peer-cache immediate per-step refresh is disabled when "
-                    "data_parallel_size=%d because request-local decode steps are "
-                    "not synchronized across EP ranks; falling back to periodic "
-                    "peer-cache refresh controlled by window_size/step_interval.",
-                    self.parallel_config.data_parallel_size,
-                )
-            peer_cache_dynamic_physical_ids = (
-                EplbState.get_peer_cache_dynamic_physical_ids(
-                    model.num_logical_experts,
-                    model.num_physical_experts,
-                    ep_size,
-                ).to(self.device)
-            )
-            peer_cache_static_physical_to_logical_map = physical_to_logical_map.clone()
-            primary_logical_to_physical = logical_to_physical_map[:, :, 0]
-            num_local_physical_experts = model.num_local_physical_experts
-            peer_cache_home_rank = (
-                primary_logical_to_physical[0] // num_local_physical_experts
-            ).to(self.device)
-        elif eplb_algorithm == "fgate-hybrid-cache":
-            if ep_group.rank() == 0 and self.parallel_config.data_parallel_size > 1:
-                if (
+                if eplb_algorithm == "fgate-hybrid-cache" and (
                     self.parallel_config.eplb_config.hybrid_periodic_rearrange_with_multi_dp
                 ):
                     logger.warning(
@@ -2293,15 +2290,17 @@ class EplbState:
                     )
                 else:
                     logger.warning(
-                        "fgate-hybrid-cache immediate local shadow refresh is enabled "
-                        "for data_parallel_size=%d, but periodic global static "
-                        "refresh is disabled to avoid long expert-migration stalls "
-                        "during online serving.",
+                        "%s immediate local shadow refresh is enabled for "
+                        "data_parallel_size=%d. This path does not rely on a "
+                        "step-synchronous global dynamic map refresh.",
+                        eplb_algorithm,
                         self.parallel_config.data_parallel_size,
                     )
-            static_redundant = (
-                self.parallel_config.eplb_config.resolved_static_redundant_experts()
-            )
+            static_redundant = 0
+            if eplb_algorithm == "fgate-hybrid-cache":
+                static_redundant = (
+                    self.parallel_config.eplb_config.resolved_static_redundant_experts()
+                )
             (
                 peer_cache_static_physical_ids,
                 peer_cache_dynamic_bank_physical_ids,
@@ -2381,23 +2380,37 @@ class EplbState:
             logical_to_physical_map = hybrid_logical_to_physical_map
             logical_replica_count = hybrid_logical_replica_count
 
+        enable_next_gate_prediction = eplb_algorithm == "fgate-only"
         model_expert_load_fgate = expert_load_fgate
         if (
             eplb_algorithm == "fgate-hybrid-cache"
             and not self._hybrid_enable_immediate_layer_refresh()
         ):
             model_expert_load_fgate = None
+        elif eplb_algorithm == "fgate-hybrid-cache":
+            enable_next_gate_prediction = True
 
+        ec = self.parallel_config.eplb_config
         model.set_eplb_state(
             expert_load_pass,
             logical_to_physical_map,
             logical_replica_count,
             expert_load_fgate=model_expert_load_fgate,
+            enable_next_gate_prediction=enable_next_gate_prediction,
             fgate_skip_prefill=(
-                eplb_algorithm in (
-                    "fgate-v2",
-                    "fgate-peer-cache",
+                (
+                    eplb_algorithm == "fgate-only"
+                    and ec.fgate_skip_prefill
                 )
+                or (
+                    eplb_algorithm == "fgate-hybrid-cache"
+                    and ec.hybrid_skip_fgate_on_prefill
+                )
+            ),
+            fgate_prefill_ignore_redundant=(
+                eplb_algorithm == "fgate-only"
+                and ec.fgate_skip_prefill
+                and ec.fgate_prefill_ignore_redundant
             ),
         )
         if not model.expert_weights or not model.expert_weights[0]:
@@ -2492,9 +2505,6 @@ class EplbState:
             - `balancedness`: The ratio of average load to maximum load.
         """
         ep_group = get_ep_group().device_group
-        if is_profile:
-            self.rearrange(is_profile=True)
-            return
 
         if is_dummy:
             # Do not record load metrics for dummy steps
@@ -2553,6 +2563,19 @@ class EplbState:
         if (
             self.model_states
             and all(
+                eplb_model_state.eplb_algorithm == "fgate-only"
+                for eplb_model_state in self.model_states.values()
+            )
+        ):
+            self._step_fgate_only(
+                is_dummy=is_dummy,
+                is_profile=is_profile,
+            )
+            return
+
+        if (
+            self.model_states
+            and all(
                 eplb_model_state.eplb_algorithm == "fgate-hybrid-cache"
                 for eplb_model_state in self.model_states.values()
             )
@@ -2564,15 +2587,8 @@ class EplbState:
             )
             return
 
-        if any(
-            eplb_model_state.eplb_algorithm == "fgate-peer-cache"
-            for eplb_model_state in self.model_states.values()
-        ) and self.parallel_config.data_parallel_size == 1:
-            self.expert_rearrangement_step += 1
-            self._run_peer_cache_fast_path(
-                is_dummy=is_dummy,
-                is_profile=is_profile,
-            )
+        if is_profile:
+            self.rearrange(is_profile=True)
             return
 
         # Update load estimation
@@ -2585,23 +2601,6 @@ class EplbState:
                     eplb_model_state.expert_load_ema.mul_(1.0 - alpha).add_(
                         eplb_model_state.expert_load_pass.float(), alpha=alpha
                     )
-                elif eplb_model_state.eplb_algorithm in (
-                    "fgate",
-                    "fgate-v2",
-                    "fgate-peer-cache",
-                ):
-                    assert eplb_model_state.expert_load_fgate is not None
-                    assert eplb_model_state.expert_load_fgate_window is not None
-                    eplb_model_state.expert_load_fgate_window[
-                        eplb_model_state.expert_load_fgate_window_step
-                    ] = eplb_model_state.expert_load_fgate.clone()
-                    eplb_model_state.expert_load_fgate_window_step += 1
-                    if (
-                        eplb_model_state.expert_load_fgate_window_step
-                        >= self.expert_load_window_size
-                    ):
-                        eplb_model_state.expert_load_fgate_window_step = 0
-                    eplb_model_state.expert_load_fgate.zero_()
                 elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
                     assert eplb_model_state.expert_load_logical_ema is not None
                     assert eplb_model_state.expert_load_fgate is not None
@@ -2676,6 +2675,20 @@ class EplbState:
         ep_group = get_ep_group().device_group
         ep_rank = ep_group.rank()
 
+        if (
+            self.model_states
+            and all(
+                eplb_model_state.eplb_algorithm == "fgate-only"
+                for eplb_model_state in self.model_states.values()
+            )
+        ):
+            if ep_rank == 0 and not is_profile:
+                logger.debug(
+                    "Skipping rearrange() for fgate-only because it only uses "
+                    "layer-local shadow refresh."
+                )
+            return None
+
         start_event = None
         end_event = None
         is_main_rank = ep_rank == 0
@@ -2710,15 +2723,6 @@ class EplbState:
                     src=eplb_model_state.expert_load_ema,
                 )
                 global_expert_load_window = logical_expert_load
-            elif eplb_model_state.eplb_algorithm in (
-                "fgate",
-                "fgate-v2",
-                "fgate-peer-cache",
-            ):
-                assert eplb_model_state.expert_load_fgate_window is not None
-                global_expert_load_window = (
-                    eplb_model_state.expert_load_fgate_window.sum(dim=0).float()
-                )
             elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
                 assert eplb_model_state.expert_load_logical_ema is not None
                 global_expert_load_window = eplb_model_state.expert_load_logical_ema
@@ -2777,12 +2781,11 @@ class EplbState:
             num_gpus = ep_group.size()
 
         if any(
-            eplb_model_state.eplb_algorithm
-            in ("fgate-peer-cache", "fgate-hybrid-cache")
+            eplb_model_state.eplb_algorithm == "fgate-hybrid-cache"
             for eplb_model_state in self.model_states.values()
         ) and num_nodes != 1:
             raise RuntimeError(
-                "fgate peer-cache algorithms currently only support same-node EPLB "
+                "local-shadow cache algorithms currently only support same-node EPLB "
                 f"(got num_nodes={num_nodes})."
             )
 
@@ -2800,34 +2803,7 @@ class EplbState:
         ):
             if not self.is_async or is_profile:
                 # Get new expert mappings for the model
-                if eplb_model_state.eplb_algorithm == "fgate-peer-cache":
-                    (
-                        new_physical_to_logical_map,
-                        new_logical_to_physical_map,
-                        new_logical_replica_count,
-                    ) = self._build_peer_cache_mapping(
-                        model_state=eplb_model_state,
-                        global_expert_load_window=global_expert_load_window,
-                        num_ranks=num_gpus,
-                    )
-                    if (
-                        is_main_rank
-                        and not is_profile
-                        and eplb_model_state.peer_cache_dynamic_physical_ids is not None
-                    ):
-                        dynamic_ids = eplb_model_state.peer_cache_dynamic_physical_ids.long()
-                        changed_slots = (
-                            eplb_model_state.physical_to_logical_map[:, dynamic_ids]
-                            != new_physical_to_logical_map[:, dynamic_ids]
-                        ).sum().item()
-                        logger.info(
-                            "fgate-peer-cache refresh for model %s: "
-                            "changed_dynamic_slots=%d/%d",
-                            eplb_model_state.model_name,
-                            changed_slots,
-                            int(dynamic_ids.numel() * eplb_model_state.model.num_moe_layers),
-                        )
-                elif eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
+                if eplb_model_state.eplb_algorithm == "fgate-hybrid-cache":
                     current_rearrange_source_map = self._get_hybrid_periodic_source_map(
                         eplb_model_state
                     )
@@ -3302,6 +3278,7 @@ class EplbLayerState:
     local_dynamic_shadow_active_bank_idx: torch.Tensor | None = None
     local_dynamic_shadow_active_physical_ids: torch.Tensor | None = None
     local_dynamic_shadow_active_logical_ids: torch.Tensor | None = None
+    prefill_ignore_redundant: bool = False
     consume_pending_layer_refresh: Callable[[], None] | None = None
     schedule_next_layer_shadow_refresh: Callable[[torch.Tensor], None] | None = None
 

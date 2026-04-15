@@ -32,6 +32,15 @@ HYBRID_PERIODIC_REARRANGE_MULTI_DP=${HYBRID_PERIODIC_REARRANGE_MULTI_DP:-1}
 # Decode-only fgate subsampling; 1 = every step.
 # For idea2-style layer-local hybrid refresh, keep this at 1 by default.
 FGATE_DECODE_STRIDE=${FGATE_DECODE_STRIDE:-1}
+# Optional fgate-hybrid-cache ablation overrides (omit from JSON when unset).
+# Tri-state bools: set to 1/0 or true/false to send explicit JSON; unset = default behavior.
+HYBRID_IMMEDIATE_LAYER_REFRESH=${HYBRID_IMMEDIATE_LAYER_REFRESH:-}
+HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE=${HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE:-}
+HYBRID_SKIP_FGATE_ON_DECODE=${HYBRID_SKIP_FGATE_ON_DECODE:-0}
+# 1 = skip forward-gate on prefill (max_query_len>1); decode still uses fgate unless HYBRID_SKIP_FGATE_ON_DECODE.
+HYBRID_SKIP_FGATE_ON_PREFILL=${HYBRID_SKIP_FGATE_ON_PREFILL:-0}
+# 单机多实例 vLLM（如双路各 DP4）必须错开，否则会争用默认 29550。
+DATA_PARALLEL_RPC_PORT=${DATA_PARALLEL_RPC_PORT:-}
 RESULTS_DIR=${RESULTS_DIR:-${ROOT_DIR}/results}
 mkdir -p "${RESULTS_DIR}"
 
@@ -74,6 +83,10 @@ EPLB_CONFIG=$(
   EMA_ALPHA="${EMA_ALPHA}" \
   HYBRID_PERIODIC_REARRANGE_MULTI_DP="${HYBRID_PERIODIC_REARRANGE_MULTI_DP}" \
   FGATE_DECODE_STRIDE="${FGATE_DECODE_STRIDE}" \
+  HYBRID_IMMEDIATE_LAYER_REFRESH="${HYBRID_IMMEDIATE_LAYER_REFRESH}" \
+  HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE="${HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE}" \
+  HYBRID_SKIP_FGATE_ON_DECODE="${HYBRID_SKIP_FGATE_ON_DECODE}" \
+  HYBRID_SKIP_FGATE_ON_PREFILL="${HYBRID_SKIP_FGATE_ON_PREFILL}" \
   python - <<'PY'
 import json
 import os
@@ -81,7 +94,13 @@ import os
 def _env_bool(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
-print(json.dumps({
+def _env_optional_bool(name: str):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    return _env_bool(name)
+
+cfg = {
     "algorithm": os.environ["ALGORITHM"],
     "ema_alpha": float(os.environ["EMA_ALPHA"]),
     "window_size": int(os.environ["WINDOW_SIZE"]),
@@ -93,7 +112,19 @@ print(json.dumps({
         "HYBRID_PERIODIC_REARRANGE_MULTI_DP"
     ),
     "fgate_decode_stride": int(os.environ["FGATE_DECODE_STRIDE"]),
-}, separators=(",", ":")))
+}
+imm = _env_optional_bool("HYBRID_IMMEDIATE_LAYER_REFRESH")
+if imm is not None:
+    cfg["hybrid_immediate_layer_refresh"] = imm
+bar = _env_optional_bool("HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE")
+if bar is not None:
+    cfg["hybrid_barrier_after_periodic_rearrange"] = bar
+if _env_bool("HYBRID_SKIP_FGATE_ON_DECODE"):
+    cfg["hybrid_skip_fgate_on_decode"] = True
+if _env_bool("HYBRID_SKIP_FGATE_ON_PREFILL"):
+    cfg["hybrid_skip_fgate_on_prefill"] = True
+
+print(json.dumps(cfg, separators=(",", ":")))
 PY
 )
 
@@ -109,6 +140,11 @@ echo "EPLB_CONFIG=${EPLB_CONFIG}"
 echo "ENFORCE_EAGER=${ENFORCE_EAGER}"
 echo "HYBRID_PERIODIC_REARRANGE_MULTI_DP=${HYBRID_PERIODIC_REARRANGE_MULTI_DP}"
 echo "FGATE_DECODE_STRIDE=${FGATE_DECODE_STRIDE}"
+echo "HYBRID_IMMEDIATE_LAYER_REFRESH=${HYBRID_IMMEDIATE_LAYER_REFRESH:-<unset>}"
+echo "HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE=${HYBRID_BARRIER_AFTER_PERIODIC_REARRANGE:-<unset>}"
+echo "HYBRID_SKIP_FGATE_ON_DECODE=${HYBRID_SKIP_FGATE_ON_DECODE}"
+echo "HYBRID_SKIP_FGATE_ON_PREFILL=${HYBRID_SKIP_FGATE_ON_PREFILL}"
+echo "DATA_PARALLEL_RPC_PORT=${DATA_PARALLEL_RPC_PORT:-<vllm default>}"
 
 exec > >(tee "${LOG_FILE}") 2>&1
 
@@ -136,6 +172,10 @@ fi
 
 if [[ "${ENFORCE_EAGER}" == "1" ]]; then
   CMD+=(--enforce-eager)
+fi
+
+if [[ -n "${DATA_PARALLEL_RPC_PORT}" ]]; then
+  CMD+=(--data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}")
 fi
 
 exec "${CMD[@]}"

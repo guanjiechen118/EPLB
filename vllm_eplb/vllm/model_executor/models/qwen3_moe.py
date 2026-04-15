@@ -42,8 +42,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import (
     eplb_fgate_decode_stride_skip_and_scale,
-    get_forward_context_max_query_len,
-    is_forward_context_available,
+    is_forward_context_prefill_batch,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -77,6 +76,10 @@ from .interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+)
+from .moe_fgate_utils import (
+    maybe_fused_gate_and_next_logits,
+    predicted_load_from_topk,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -236,32 +239,36 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
+        is_prefill_batch = is_forward_context_prefill_batch()
+        skip_fgate_prefill_opt = (
+            getattr(self.experts, "fgate_skip_prefill", False) and is_prefill_batch
+        )
+        prefill_ignore_redundant_opt = (
+            getattr(self.experts.eplb_state, "prefill_ignore_redundant", False)
+            and is_prefill_batch
+        )
+
         consume_pending_layer_refresh = getattr(
             self.experts.eplb_state, "consume_pending_layer_refresh", None
         )
-        if consume_pending_layer_refresh is not None:
+        if consume_pending_layer_refresh is not None and not prefill_ignore_redundant_opt:
             consume_pending_layer_refresh()
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        if (
-            getattr(self.experts, "next_gate_weight", None) is not None
-        ):
-            skip_fgate_prefill_opt = (
-                getattr(self.experts, "fgate_skip_prefill", False)
-                and is_forward_context_available()
-                and get_forward_context_max_query_len() > 1
-            )
+        next_gate_weight = getattr(self.experts, "next_gate_weight", None)
+        if next_gate_weight is not None:
             stride_skip, stride_scale = eplb_fgate_decode_stride_skip_and_scale()
             if not skip_fgate_prefill_opt and not stride_skip:
+                router_logits, pred_logits = maybe_fused_gate_and_next_logits(
+                    hidden_states,
+                    self.gate,
+                    next_gate_weight,
+                )
                 with torch.no_grad():
-                    pred_logits = torch.nn.functional.linear(
-                        hidden_states, self.experts.next_gate_weight
+                    pred_load = predicted_load_from_topk(
+                        pred_logits,
+                        top_k=self.experts.top_k,
+                        stride_scale=stride_scale,
                     )
-                    pred_scores = pred_logits.float().softmax(dim=-1)
-                    pred_load = pred_scores.sum(dim=0)
-                    if stride_scale != 1.0:
-                        pred_load = pred_load * stride_scale
                     if getattr(self.experts, "expert_load_fgate_view", None) is not None:
                         self.experts.expert_load_fgate_view.add_(pred_load)
                     schedule_next_layer_shadow_refresh = getattr(
@@ -271,6 +278,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     )
                     if schedule_next_layer_shadow_refresh is not None:
                         schedule_next_layer_shadow_refresh(pred_load)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+        else:
+            router_logits, _ = self.gate(hidden_states)
         shared_out, fused_out = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -800,10 +811,12 @@ class Qwen3MoeForCausalLM(
         logical_to_physical_map: torch.Tensor,
         logical_replica_count: torch.Tensor,
         expert_load_fgate: torch.Tensor | None = None,
+        enable_next_gate_prediction: bool = False,
         fgate_skip_prefill: bool = False,
+        fgate_prefill_ignore_redundant: bool = False,
     ) -> None:
         gate_weights: list[torch.Tensor] = []
-        if expert_load_fgate is not None:
+        if enable_next_gate_prediction:
             gate_weights = [moe.gate.weight for moe in self.moe_mlp_layers]
 
         for layer_idx, layer in enumerate(self.moe_layers):
@@ -823,6 +836,7 @@ class Qwen3MoeForCausalLM(
                 expert_load_fgate_view=expert_load_fgate,
                 expert_load_fgate_target_idx=next_layer_idx,
                 fgate_skip_prefill=fgate_skip_prefill,
+                fgate_prefill_ignore_redundant=fgate_prefill_ignore_redundant,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

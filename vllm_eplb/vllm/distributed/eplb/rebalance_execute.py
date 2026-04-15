@@ -44,6 +44,44 @@ class RecvMetadata:
 MoveToBufferResult = tuple[np.ndarray, np.ndarray, RecvMetadata]
 
 
+def _resolve_source_rows(
+    available_experts: np.ndarray,
+    available_rows: np.ndarray,
+    desired_experts: np.ndarray,
+) -> np.ndarray:
+    positions = np.searchsorted(available_experts, desired_experts)
+    valid = np.logical_and(
+        positions < available_experts.shape[0],
+        available_experts[np.minimum(positions, available_experts.shape[0] - 1)]
+        == desired_experts,
+    )
+    if not bool(valid.all()):
+        missing_experts = np.unique(desired_experts[~valid]).tolist()
+        raise RuntimeError(
+            "Failed to resolve local source rows for experts: "
+            f"{missing_experts}"
+        )
+    return available_rows[positions]
+
+
+def _copy_rows_batched(
+    source_tensors: Sequence[torch.Tensor],
+    target_tensors: Sequence[torch.Tensor],
+    source_rows: np.ndarray,
+    target_rows: np.ndarray,
+) -> None:
+    if target_rows.size == 0:
+        return
+
+    src_index_cpu = torch.from_numpy(source_rows.astype(np.int64, copy=False))
+    dst_index_cpu = torch.from_numpy(target_rows.astype(np.int64, copy=False))
+
+    for src_tensor, dst_tensor in zip(source_tensors, target_tensors):
+        src_index = src_index_cpu.to(device=src_tensor.device)
+        dst_index = dst_index_cpu.to(device=dst_tensor.device)
+        dst_tensor.index_copy_(0, dst_index, src_tensor.index_select(0, src_index))
+
+
 def get_ep_ranks_with_experts_batch(
     expert_ids: np.ndarray,
     num_local_experts: int,
@@ -239,16 +277,21 @@ def move_to_buffer(
 
     # 1. Local moves into tmp buffers
     if bool(eligible_local_buffer_mask.any()) and send_count > 0:
-        dest_indices = np.nonzero(eligible_local_buffer_mask)[0].tolist()
-        expert_to_src_map = dict(
-            zip(send_expert_ids[:send_count], send_src_rows[:send_count])
+        dest_indices = np.nonzero(eligible_local_buffer_mask)[0].astype(
+            np.int64, copy=False
         )
-        for dst in dest_indices:
-            expert = new_local_expert_ids[dst]
-            src_local = expert_to_src_map.get(expert, -1)
-            if src_local != -1:
-                for w, b in zip(expert_weights, expert_weights_buffers):
-                    b[dst].copy_(w[src_local], non_blocking=True)
+        desired_experts = new_local_expert_ids[dest_indices]
+        src_locals = _resolve_source_rows(
+            available_experts=send_expert_ids[:send_count],
+            available_rows=send_src_rows[:send_count],
+            desired_experts=desired_experts,
+        )
+        _copy_rows_batched(
+            source_tensors=expert_weights,
+            target_tensors=expert_weights_buffers,
+            source_rows=src_locals,
+            target_rows=dest_indices,
+        )
 
     p2p_ops: list[P2POp] = []
     if isinstance(get_ep_group(), StatelessGroupCoordinator):
@@ -435,13 +478,20 @@ def move_to_buffer_local_only(
             old_local_expert_ids[valid_old], return_index=True
         )
         src_rows = local_rows[valid_old][first_idx]
-        expert_to_src_map = dict(zip(uniq_experts.tolist(), src_rows.tolist()))
-        dest_indices = np.nonzero(np.logical_and(~is_unchanged, new_valid))[0].tolist()
-        for dst in dest_indices:
-            expert = int(new_local_expert_ids[dst])
-            src = expert_to_src_map[expert]
-            for w, b in zip(expert_weights, expert_weights_buffers):
-                b[dst].copy_(w[src], non_blocking=True)
+        dest_indices = np.nonzero(np.logical_and(~is_unchanged, new_valid))[0].astype(
+            np.int64, copy=False
+        )
+        src_indices = _resolve_source_rows(
+            available_experts=uniq_experts,
+            available_rows=src_rows,
+            desired_experts=new_local_expert_ids[dest_indices],
+        )
+        _copy_rows_batched(
+            source_tensors=expert_weights,
+            target_tensors=expert_weights_buffers,
+            source_rows=src_indices,
+            target_rows=dest_indices,
+        )
 
     return (
         is_unchanged,
@@ -490,10 +540,13 @@ def move_from_buffer(
     copy_mask = np.logical_or(is_received_locally, recv_primary_mask)
     dest_mask_np = np.logical_and(~is_unchanged, copy_mask)
     if bool(dest_mask_np.any()):
-        dest_indices = np.nonzero(dest_mask_np)[0].tolist()
-        for dst in dest_indices:
-            for w, b in zip(expert_weights, expert_weights_buffers):
-                w[dst].copy_(b[dst], non_blocking=True)
+        dest_indices = np.nonzero(dest_mask_np)[0].astype(np.int64, copy=False)
+        _copy_rows_batched(
+            source_tensors=expert_weights_buffers,
+            target_tensors=expert_weights,
+            source_rows=dest_indices,
+            target_rows=dest_indices,
+        )
 
     if recv_count == 0:
         return
@@ -529,9 +582,12 @@ def move_from_buffer(
     matched_dst_rows = dup_dst_rows[valid]
     matched_src_rows = prim_dsts_sorted[pos[valid]]
 
-    for dst, src in zip(matched_dst_rows.tolist(), matched_src_rows.tolist()):
-        for w in expert_weights:
-            w[dst].copy_(w[src], non_blocking=True)
+    _copy_rows_batched(
+        source_tensors=expert_weights,
+        target_tensors=expert_weights,
+        source_rows=matched_src_rows.astype(np.int64, copy=False),
+        target_rows=matched_dst_rows.astype(np.int64, copy=False),
+    )
 
 
 async def transfer_layer(

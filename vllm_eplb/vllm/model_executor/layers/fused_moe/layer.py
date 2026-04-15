@@ -396,6 +396,7 @@ class FusedMoE(CustomOp):
         self.next_gate_weight: torch.Tensor | None = None
         self.expert_load_fgate_view: torch.Tensor | None = None
         self.fgate_skip_prefill: bool = False
+        self.fgate_prefill_ignore_redundant: bool = False
         self.expert_placement_strategy: ExpertPlacementStrategy = (
             vllm_config.parallel_config.expert_placement_strategy
         )
@@ -1459,6 +1460,7 @@ class FusedMoE(CustomOp):
         expert_load_fgate_view: torch.Tensor | None = None,
         expert_load_fgate_target_idx: int | None = None,
         fgate_skip_prefill: bool = False,
+        fgate_prefill_ignore_redundant: bool = False,
     ) -> None:
         """
         Register the EPLB state in this layer.
@@ -1486,6 +1488,8 @@ class FusedMoE(CustomOp):
         self.next_gate_weight = next_gate_weight
         self.expert_load_fgate_view = self.eplb_state.expert_load_fgate_view
         self.fgate_skip_prefill = fgate_skip_prefill
+        self.fgate_prefill_ignore_redundant = fgate_prefill_ignore_redundant
+        self.eplb_state.prefill_ignore_redundant = fgate_prefill_ignore_redundant
 
     def ensure_moe_quant_config_init(self):
         if self.quant_method.moe_quant_config is None:
@@ -1578,7 +1582,7 @@ class FusedMoE(CustomOp):
                 num_redundant_experts,
                 ep_size=ep_size,
                 balance_redundant=(
-                    eplb_algorithm in ("fgate-peer-cache", "fgate-hybrid-cache")
+                    eplb_algorithm in ("fgate-only", "fgate-hybrid-cache")
                 ),
             )
         )

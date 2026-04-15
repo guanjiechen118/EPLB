@@ -58,9 +58,7 @@ class EPLBConfig:
     algorithm: Literal[
         "swm",
         "ema",
-        "fgate",
-        "fgate-v2",
-        "fgate-peer-cache",
+        "fgate-only",
         "fgate-hybrid-cache",
     ] = "swm"
     """Algorithm for EPLB load estimation.
@@ -70,17 +68,12 @@ class EPLBConfig:
       fixed-size circular buffer of recent load observations.
     - "ema": Exponential Moving Average. Uses a decay factor
       (controlled by ``ema_alpha``) to weight recent observations more.
-    - "fgate": Forward Gate. Predicts next layer's expert load by running
-      current hidden states through the next layer's gate network.
-    - "fgate-v2": Forward Gate V2. Same as fgate but skips the prediction
-      computation during prefill batches (max_query_len > 1).
-    - "fgate-peer-cache": Uses fgate predicted logical-expert demand to
-      refresh only the redundant expert slots as a same-node peer-GPU cache.
-      Primary expert slots remain fixed while redundant slots are repopulated
-      by peer-to-peer expert weight copies. When ``data_parallel_size=1`` the
-      refresh can run on the immediate decode fast path; otherwise it falls
-      back to periodic refresh controlled by ``window_size``/``step_interval``
-      to avoid deadlocks across unsynchronized DP workers.
+    - "fgate-only": Decode-only local-shadow immediate refresh. All redundant
+      slots are split into two double-buffered local shadow banks. Current
+      layer hidden states predict next-layer expert demand, and the runtime
+      stages the next-layer shadow bank copy immediately so the new bank can
+      flip at the next layer boundary. This path never mutates the global
+      runtime map and does not perform periodic global rearrangement.
     - "fgate-hybrid-cache": Same-node hybrid peer cache. Primary expert slots
       remain fixed, a configurable subset of redundant slots is refreshed by a
       slow EMA path, and the remaining redundant slots are split into two
@@ -145,11 +138,60 @@ class EPLBConfig:
 
     fgate_decode_stride: int = Field(default=4, ge=1)
     """
-    For fgate-style EPLB algorithms, run the forward-gate predictor only on a
-    subsample of decode steps (batches with ``max_query_len==1``). ``1`` means
-    every decode step (highest accuracy, highest overhead). Values ``>1`` reduce
-    per-token MoE overhead (TPOT/ITL); on sampled steps the accumulated load is
-    scaled by this stride to approximate the skipped updates.
+    For local-shadow fgate EPLB algorithms, run the forward-gate predictor only
+    on a subsample of decode steps (batches with ``max_query_len==1``). ``1``
+    means every decode step (highest accuracy, highest overhead). Values ``>1``
+    reduce per-token MoE overhead (TPOT/ITL); on sampled steps the accumulated
+    load is scaled by this stride to approximate the skipped updates.
+    """
+
+    fgate_skip_prefill: bool = True
+    """
+    When ``algorithm="fgate-only"`` and True, skip forward-gate EPLB
+    prediction during prefill batches (``max_query_len > 1``). Default True
+    preserves the historical decode-only behavior.
+    """
+
+    fgate_prefill_ignore_redundant: bool = False
+    """
+    When ``algorithm="fgate-only"`` and ``fgate_skip_prefill`` are both True,
+    route prefill batches through the primary expert mapping only, bypassing
+    redundant-replica selection, local dynamic shadow rewrites, and prefill-time
+    refresh consumption. Default False preserves the historical runtime map.
+    """
+
+    hybrid_immediate_layer_refresh: bool | None = None
+    """
+    When ``algorithm="fgate-hybrid-cache"``, optionally override whether
+    immediate per-layer local shadow refresh is enabled.
+
+    ``None`` (default) preserves the historical behavior derived from
+    ``data_parallel_size`` and ``hybrid_periodic_rearrange_with_multi_dp``.
+    """
+
+    hybrid_barrier_after_periodic_rearrange: bool | None = None
+    """
+    When ``algorithm="fgate-hybrid-cache"``, optionally override whether a
+    barrier runs after hybrid periodic rearrange under multi-DP.
+
+    ``None`` (default) preserves the historical behavior tied to
+    ``hybrid_periodic_rearrange_with_multi_dp``.
+    """
+
+    hybrid_skip_fgate_on_decode: bool = False
+    """
+    When ``algorithm="fgate-hybrid-cache"`` and True, skip forward-gate EPLB
+    work on decode steps (``max_query_len==1``). Default False matches the
+    pre-flag behavior (fgate still follows ``fgate_decode_stride``).
+    """
+
+    hybrid_skip_fgate_on_prefill: bool = False
+    """
+    When ``algorithm="fgate-hybrid-cache"`` and True, skip forward-gate EPLB
+    prediction during prefill batches (``max_query_len > 1``); decode steps
+    (``max_query_len==1``) still run fgate subject to ``fgate_decode_stride`` and
+    ``hybrid_skip_fgate_on_decode``. Default False preserves prior hybrid behavior
+    (fgate ran on prefill unless disabled elsewhere).
     """
 
     @model_validator(mode="after")
@@ -161,9 +203,7 @@ class EPLBConfig:
         supported_eplb_algorithms = (
             "swm",
             "ema",
-            "fgate",
-            "fgate-v2",
-            "fgate-peer-cache",
+            "fgate-only",
             "fgate-hybrid-cache",
         )
         if self.algorithm not in supported_eplb_algorithms:
@@ -171,9 +211,9 @@ class EPLBConfig:
                 f"Unsupported EPLB algorithm '{self.algorithm}'. "
                 f"Supported: {supported_eplb_algorithms}."
             )
-        if self.algorithm == "fgate-peer-cache" and self.use_async:
+        if self.algorithm == "fgate-only" and self.use_async:
             raise ValueError(
-                "fgate-peer-cache currently only supports synchronous EPLB "
+                "fgate-only currently only supports synchronous EPLB "
                 "(use_async=False)."
             )
         if self.algorithm == "fgate-hybrid-cache" and self.use_async:
@@ -498,9 +538,7 @@ class ParallelConfig:
             supported_eplb_algorithms = (
                 "swm",
                 "ema",
-                "fgate",
-                "fgate-v2",
-                "fgate-peer-cache",
+                "fgate-only",
                 "fgate-hybrid-cache",
             )
             if self.eplb_config.algorithm not in supported_eplb_algorithms:
@@ -509,23 +547,28 @@ class ParallelConfig:
                     f"'{self.eplb_config.algorithm}'. Supported: "
                     f"{supported_eplb_algorithms}."
                 )
-            if self.eplb_config.algorithm == "fgate-peer-cache":
+            if self.eplb_config.algorithm == "fgate-only":
                 ep_size = self.tensor_parallel_size * self.data_parallel_size
                 if self.eplb_config.num_redundant_experts <= 0:
                     raise ValueError(
-                        "fgate-peer-cache requires "
+                        "fgate-only requires "
                         "eplb_config.num_redundant_experts > 0."
                     )
-                if self.eplb_config.num_redundant_experts % ep_size != 0:
+                if self.eplb_config.num_static_redundant_experts != 0:
                     raise ValueError(
-                        "fgate-peer-cache requires "
-                        "eplb_config.num_redundant_experts to be divisible by "
-                        f"the EP size ({ep_size}), but got "
-                        f"{self.eplb_config.num_redundant_experts}."
+                        "fgate-only does not use static redundant slots; "
+                        "set eplb_config.num_static_redundant_experts=0."
+                    )
+                if self.eplb_config.num_redundant_experts % (2 * ep_size) != 0:
+                    raise ValueError(
+                        "fgate-only requires the redundant expert slots to be "
+                        "evenly split across two banks on each EP rank; got "
+                        f"redundant slots={self.eplb_config.num_redundant_experts} "
+                        f"for EP size {ep_size}."
                     )
                 if self.eplb_config.use_async:
                     raise ValueError(
-                        "fgate-peer-cache does not support async EPLB yet."
+                        "fgate-only does not support async EPLB yet."
                     )
             if self.eplb_config.algorithm == "fgate-hybrid-cache":
                 ep_size = self.tensor_parallel_size * self.data_parallel_size

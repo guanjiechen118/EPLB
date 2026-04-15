@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 _EPLB_FGATE_DECODE_STRIDE_TICK: int = 0
 _EPLB_FGATE_ALGORITHMS: frozenset[str] = frozenset(
-    ("fgate", "fgate-v2", "fgate-peer-cache", "fgate-hybrid-cache")
+    ("fgate-only", "fgate-hybrid-cache")
 )
 
 track_batchsize: bool = envs.VLLM_LOG_BATCHSIZE_INTERVAL >= 0
@@ -303,6 +303,12 @@ def eplb_fgate_decode_stride_skip_and_scale() -> tuple[bool, float]:
     if not is_forward_context_available():
         return False, 1.0
     ctx = get_forward_context()
+    if ctx.additional_kwargs.get("eplb_hybrid_skip_fgate_decode"):
+        mq = ctx.additional_kwargs.get("max_query_len")
+        if mq is None:
+            mq = get_forward_context_max_query_len()
+        if int(mq) <= 1:
+            return True, 1.0
     tick = int(ctx.additional_kwargs.get("eplb_fgate_decode_stride_tick", 0))
     if tick <= 0:
         return False, 1.0
@@ -318,6 +324,13 @@ def eplb_fgate_decode_stride_skip_and_scale() -> tuple[bool, float]:
     if ((tick - 1) % stride) != 0:
         return True, 1.0
     return False, float(stride)
+
+
+def is_forward_context_prefill_batch(default: bool = False) -> bool:
+    """Best-effort check for whether the current forward is a prefill batch."""
+    if not is_forward_context_available():
+        return default
+    return get_forward_context_max_query_len(default=1) > 1
 
 
 def get_forward_context_max_query_len(default: int = 1) -> int:
@@ -469,6 +482,13 @@ def set_forward_context(
     pc = vllm_config.parallel_config
     ec = pc.eplb_config
     mq_int = int(additional_kwargs.get("max_query_len", 1))
+    hybrid_skip_decode = (
+        pc.enable_eplb
+        and ec.algorithm == "fgate-hybrid-cache"
+        and ec.hybrid_skip_fgate_on_decode
+        and mq_int <= 1
+    )
+    additional_kwargs["eplb_hybrid_skip_fgate_decode"] = hybrid_skip_decode
     if (
         attn_metadata is not None
         and pc.enable_eplb

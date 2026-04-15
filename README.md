@@ -6,9 +6,9 @@
     - 122B-A10B: /mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-122B-A10B/snapshots/b000b2eb18a7f4cdf3153c4215842da339e09d99/
 4. Qwen3: /mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/4c446470ba0aec43e22ac1128f9ffd915f338ba3/
 
-## fgate / fgate-v2
+## fgate-only / fgate-hybrid-cache
 
-`vllm_eplb` now supports EPLB `fgate`, `fgate-v2`, `fgate-peer-cache`, and `fgate-hybrid-cache` for:
+`vllm_eplb` now supports EPLB `fgate-only` and `fgate-hybrid-cache` for:
 
 - DeepSeek-V2-Lite (`DeepseekV2ForCausalLM`)
 - Qwen3-30B-A3B (`Qwen3MoeForCausalLM`)
@@ -16,19 +16,13 @@
 
 ### Algorithm summary
 
-- `fgate`: after the current layer finishes routing, use the current hidden states and the **next** MoE gate to predict the next-layer expert load, then feed that prediction into EPLB.
-- `fgate-v2`: same as `fgate`, but skips the prediction during prefill (`max_query_len > 1`) and only accumulates predicted load during decode. This reduces prefill overhead for long-context serving.
-- `fgate-peer-cache`: same-node peer-GPU predictive replication for redundant expert slots. Primary slots stay fixed; only redundant slots are refreshed from peer GPUs using fgate-predicted logical demand. This currently requires `num_redundant_experts` to be divisible by the EP size and is intended for single-node runs. With `data_parallel_size=1` it can use the immediate decode fast path; with `data_parallel_size>1` it safely falls back to periodic refresh driven by `window_size` / `step_interval`.
+- `fgate-only`: correct idea2-style local-shadow immediate refresh. All redundant slots are split into two double-buffered local shadow banks. After layer `l` predicts layer `l+1` demand, the runtime immediately stages layer `l+1`'s standby bank and flips it at the next layer boundary. This path is decode-focused, local-only, and never mutates the global runtime routing map.
 - `fgate-hybrid-cache`: hybrid same-node peer cache. A static subset of redundant slots is managed by EMA, while the remaining redundant slots are split into two double-buffered fgate banks so the runtime can prefetch the next predicted expert set before swapping banks.
 
 Example `eplb-config` values:
 
 ```bash
---enable-eplb --eplb-config '{"algorithm":"fgate","window_size":1000,"step_interval":1000,"num_redundant_experts":2,"log_balancedness":true}'
-
---enable-eplb --eplb-config '{"algorithm":"fgate-v2","window_size":1000,"step_interval":1000,"num_redundant_experts":2,"log_balancedness":true}'
-
---enable-eplb --eplb-config '{"algorithm":"fgate-peer-cache","window_size":1000,"step_interval":1000,"num_redundant_experts":8,"log_balancedness":true}'
+--enable-eplb --eplb-config '{"algorithm":"fgate-only","window_size":1000,"step_interval":1000,"num_redundant_experts":8,"log_balancedness":true}'
 
 --enable-eplb --eplb-config '{"algorithm":"fgate-hybrid-cache","window_size":1000,"step_interval":1000,"num_redundant_experts":16,"num_static_redundant_experts":8,"log_balancedness":true}'
 ```
@@ -42,6 +36,7 @@ A compact script directory is available at:
 Files:
 
 - `scripts/serve_eplb.sh`: start a server with model profiles and `fgate` / `fgate-v2`
+  该脚本里的旧算法名如果仍存在，需要改成 `fgate-only`。
 - `scripts/bench_serve.sh`: run `vllm bench serve` with either `random` or `custom` datasets
 - `scripts/common.sh`: model path profiles and default max length values
 

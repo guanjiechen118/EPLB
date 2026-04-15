@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.forward_context import is_forward_context_prefill_batch
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
     FusedMoERouter,
 )
@@ -207,22 +208,36 @@ class BaseRouter(FusedMoERouter):
             self.indices_type_getter() if self.indices_type_getter is not None else None
         )
 
+    def _use_prefill_primary_only_mapping(self) -> bool:
+        return bool(
+            self.eplb_state.prefill_ignore_redundant
+            and is_forward_context_prefill_batch()
+        )
+
     def _apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """Apply EPLB mapping to convert logical expert IDs to physical expert IDs."""
         if self.enable_eplb:
             assert self.eplb_state.expert_load_view is not None
             assert self.eplb_state.logical_to_physical_map is not None
             assert self.eplb_state.logical_replica_count is not None
+            use_prefill_primary_only = self._use_prefill_primary_only_mapping()
+            logical_to_physical_map = self.eplb_state.logical_to_physical_map
+            logical_replica_count = self.eplb_state.logical_replica_count
+            if use_prefill_primary_only:
+                logical_to_physical_map = logical_to_physical_map[..., :1]
+                logical_replica_count = torch.ones_like(logical_replica_count)
             topk_ids = eplb_map_to_physical(
                 topk_ids=topk_ids,
-                logical_to_physical_map=self.eplb_state.logical_to_physical_map,
-                logical_replica_count=self.eplb_state.logical_replica_count,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
             )
-            topk_ids = self._apply_local_dynamic_shadow_mapping(topk_ids)
-            return eplb_record_physical_expert_load(
-                topk_ids=topk_ids,
-                expert_load_view=self.eplb_state.expert_load_view,
-            )
+            if not use_prefill_primary_only:
+                topk_ids = self._apply_local_dynamic_shadow_mapping(topk_ids)
+                return eplb_record_physical_expert_load(
+                    topk_ids=topk_ids,
+                    expert_load_view=self.eplb_state.expert_load_view,
+                )
+            return topk_ids
         return topk_ids
 
     def _apply_local_dynamic_shadow_mapping(

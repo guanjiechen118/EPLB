@@ -22,6 +22,8 @@ STEP_INTERVAL=${STEP_INTERVAL:-1000}
 EMA_ALPHA=${EMA_ALPHA:-0.01}
 NUM_REDUNDANT_EXPERTS=${NUM_REDUNDANT_EXPERTS:-16}
 LOG_BALANCEDNESS=${LOG_BALANCEDNESS:-false}
+# 单机多实例 vLLM（DP>1）时需错开，默认留空使用 vLLM 内置端口。
+DATA_PARALLEL_RPC_PORT=${DATA_PARALLEL_RPC_PORT:-}
 RESULTS_DIR=${RESULTS_DIR:-${ROOT_DIR}/results}
 mkdir -p "${RESULTS_DIR}"
 
@@ -63,6 +65,7 @@ echo "DP_SIZE=${DP_SIZE}"
 echo "SERVER_SEED=${SERVER_SEED}"
 echo "LOG_FILE=${LOG_FILE}"
 echo "EPLB_CONFIG=${EPLB_CONFIG}"
+echo "DATA_PARALLEL_RPC_PORT=${DATA_PARALLEL_RPC_PORT:-<vllm default>}"
 
 exec > >(tee "${LOG_FILE}") 2>&1
 
@@ -86,6 +89,10 @@ CMD=(
 
 if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
   CMD+=(--trust-remote-code)
+fi
+
+if [[ -n "${DATA_PARALLEL_RPC_PORT}" ]]; then
+  CMD+=(--data-parallel-rpc-port "${DATA_PARALLEL_RPC_PORT}")
 fi
 
 exec "${CMD[@]}"

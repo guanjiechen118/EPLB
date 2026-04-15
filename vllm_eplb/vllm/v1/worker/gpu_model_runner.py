@@ -410,35 +410,24 @@ class GPUModelRunner(
         if (
             parallel_config.enable_eplb
             and parallel_config.eplb_config.algorithm
-            in ("fgate-peer-cache", "fgate-hybrid-cache")
+            in ("fgate-only", "fgate-hybrid-cache")
         ):
-            if parallel_config.eplb_config.algorithm == "fgate-hybrid-cache":
+            if parallel_config.eplb_config.algorithm in (
+                "fgate-only",
+                "fgate-hybrid-cache",
+            ):
                 if self.compilation_config.cudagraph_mode not in (
                     CUDAGraphMode.NONE,
                     CUDAGraphMode.PIECEWISE,
                 ):
                     logger.warning(
-                        "fgate-hybrid-cache is overriding cudagraph_mode from %s "
-                        "to PIECEWISE so layer-local shadow refresh can execute "
-                        "between MoE layers on the Python path.",
+                        "%s is overriding cudagraph_mode from %s to PIECEWISE "
+                        "so layer-local shadow refresh can execute between MoE "
+                        "layers on the Python path.",
+                        parallel_config.eplb_config.algorithm,
                         self.compilation_config.cudagraph_mode.name,
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
-            elif self.compilation_config.cudagraph_mode not in (
-                CUDAGraphMode.NONE,
-                CUDAGraphMode.PIECEWISE,
-                CUDAGraphMode.FULL_DECODE_ONLY,
-            ):
-                logger.warning(
-                    "%s is overriding cudagraph_mode from %s to "
-                    "FULL_DECODE_ONLY so decode can stay graphed while "
-                    "peer-cache refresh remains outside capture.",
-                    parallel_config.eplb_config.algorithm,
-                    self.compilation_config.cudagraph_mode.name,
-                )
-                self.compilation_config.cudagraph_mode = (
-                    CUDAGraphMode.FULL_DECODE_ONLY
-                )
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype

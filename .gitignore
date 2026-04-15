@@ -16,3 +16,10 @@ __pycache__/
 venv/
 
 results/
+scripts/eval1
+
+# Keep oversized HotpotQA training shards local; GitHub rejects them.
+data/domain_shift_hf/benchmarks/hotpot_qa/distractor/train-00000-of-00002.parquet
+data/domain_shift_hf/benchmarks/hotpot_qa/distractor/train-00001-of-00002.parquet
+data/domain_shift_hf/benchmarks/hotpot_qa/fullwiki/train-00000-of-00002.parquet
+data/domain_shift_hf/benchmarks/hotpot_qa/fullwiki/train-00001-of-00002.parquet

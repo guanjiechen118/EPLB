@@ -9,20 +9,53 @@ export PATH=/usr/local/nvidia/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/nvidia/lib64
 export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH
 
-MODEL=/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--deepseek-ai--DeepSeek-V3-Base/snapshots/afb92e1fa402c2be2a9eb085312bb02e0384d6c7
-RESULTS_DIR=./results
+MODEL="/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3-235B-A22B-Instruct-2507/snapshots/56e16a623ffb2855ca901a65166a9170e99df127"
+RESULTS_DIR=./results-qwen3-200B
 mkdir -p "$RESULTS_DIR"
+
 
 vllm bench serve \
     --backend vllm \
     --model "$MODEL" \
     --port 8000 \
-    --dataset-name random \
-    --random-input-len 128 \
-    --request-rate 1 \
-    --max-concurrency 1 \
-    --random-output-len 128 \
-    --num-prompts 10 \
+    --dataset-name custom \
+    --dataset-path /mnt/shared-storage-user/chenguanjie/huawei_eplb/data/domain_shift_hf/scenarios/alternating_2.jsonl \
+    --num-prompts 2048 \
+    --request-rate inf \
+    --max-concurrency 512 \
     --save-result \
+    --seed 0 \
+    --temperature 0 \
+    --result-dir "$RESULTS_DIR" \
+    --result-filename "${EXPERIMENT_NAME}.json"
+
+vllm bench serve \
+    --backend vllm \
+    --model "$MODEL" \
+    --port 8000 \
+    --dataset-name custom \
+    --dataset-path /mnt/shared-storage-user/chenguanjie/huawei_eplb/data/domain_shift_hf/scenarios/alternating_2.jsonl \
+    --num-prompts 2048 \
+    --request-rate inf \
+    --max-concurrency 512 \
+    --save-result \
+    --seed 0 \
+    --temperature 0 \
+    --result-dir "$RESULTS_DIR" \
+    --result-filename "${EXPERIMENT_NAME}.json"
+
+
+vllm bench serve \
+    --backend vllm \
+    --model "$MODEL" \
+    --port 8000 \
+    --dataset-name custom \
+    --dataset-path /mnt/shared-storage-user/chenguanjie/huawei_eplb/data/domain_shift_hf/scenarios/alternating_2.jsonl \
+    --num-prompts 2048 \
+    --request-rate inf \
+    --max-concurrency 512 \
+    --save-result \
+    --seed 0 \
+    --temperature 0 \
     --result-dir "$RESULTS_DIR" \
     --result-filename "${EXPERIMENT_NAME}.json"
